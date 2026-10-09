@@ -1,0 +1,28 @@
+# 库数据不进仓库：library/ 是**你本人的库**（SQLite + 原始文件 + 2G 的导出件），
+# 属于个人数据、体积也大；要分享或备份请单独用 `toak` 的导出功能。
+library/
+!library/.gitkeep
+
+# Python 运行产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# 临时文件与调试输出
+*.log
+*.tmp
+/tmp_*
+
+# ������PyInstaller��
+build/
+dist/
+*.spec.bak

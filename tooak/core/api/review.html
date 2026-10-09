@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ToOak · 查看端</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #dfe3e8; --text: #1f2733;
+    --muted: #6b7684; --accent: #2f7fd1; --accent-soft: #e8f1fb;
+    --ok: #2f9e63; --warn: #c9821b; --bad: #c8524a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: var(--text); background: var(--bg); height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .where { color: var(--muted); font-size: 12px; }
+  main { flex: 1; display: grid; grid-template-columns: 268px 1fr 340px; min-height: 0; }
+  aside, section { min-height: 0; overflow: auto; background: var(--panel); }
+  aside { border-right: 1px solid var(--line); padding: 8px 0; }
+  section.center { border-right: 1px solid var(--line); background: #fbfcfd; }
+  aside h2, section h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); margin: 12px 14px 6px; font-weight: 600;
+  }
+  .node-item, .doc-item, .project-item {
+    padding: 4px 14px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .project-item { font-weight: 600; }
+  .doc-item:hover, .project-item:hover { background: var(--accent-soft); }
+  .doc-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .doc-item .count { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  .children { margin-left: 12px; border-left: 1px dashed var(--line); }
+  .graph-wrap { padding: 4px 0 12px; }
+  svg.flow { display: block; width: 100%; height: auto; }
+  .flow .vbox { cursor: pointer; }
+  .flow .vbox rect { fill: #fff; stroke: var(--line); stroke-width: 1.4; rx: 8; }
+  .flow .vbox.sel rect { stroke: var(--accent); stroke-width: 2.4; }
+  .flow .vbox .seq { font-size: 13px; font-weight: 700; }
+  .flow .vbox .meta { font-size: 10.5px; fill: var(--muted); }
+  .flow .vbox .change { font-size: 10px; fill: #4a5666; }
+  .flow .edge { stroke: #a9b4c2; stroke-width: 1.6; fill: none; }
+  .flow .edge.restore { stroke: var(--warn); stroke-dasharray: 5 4; }
+  .flow .elabel { font-size: 9.5px; fill: #93a0b0; }
+  .flow .axis { stroke: #e6eaef; stroke-width: 1; }
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+    border: 1px solid transparent;
+  }
+  .badge.active { background: #eaf3fc; color: #22648f; }
+  .badge.done { background: #e9f7f0; color: var(--ok); }
+  .badge.on_hold { background: #fdf6e6; color: #96731c; }
+  .badge.draft, .badge.pending { background: #eef1f4; color: #5d6875; }
+  .badge.approved { background: #e8f6ee; color: var(--ok); }
+  .badge.rejected { background: #fbeceb; color: var(--bad); }
+  .chip {
+    border: 1px solid var(--line); background: #fff; border-radius: 999px;
+    padding: 2px 10px; font-size: 12px; cursor: pointer;
+  }
+  .chip.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .detail { padding: 0 14px 20px; }
+  .kv { display: grid; grid-template-columns: 74px 1fr; gap: 2px 10px; margin: 8px 0 14px; }
+  .kv dt { color: var(--muted); font-size: 12px; }
+  .kv dd { margin: 0; font-size: 13px; word-break: break-all; }
+  .files { list-style: none; padding: 0; margin: 0 0 12px; }
+  .files li { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; font-size: 12.5px; }
+  .files .role { color: var(--muted); font-size: 11px; }
+  pre.diff {
+    background: #1f2733; color: #dfe6ee; padding: 10px 12px; border-radius: 8px;
+    font: 12px/1.5 ui-monospace, Consolas, monospace; overflow: auto; max-height: 340px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  pre.diff .add { color: #8ee2a8; } pre.diff .del { color: #ff9c95; }
+  pre.diff .hunk { color: #8fb8ff; }
+  .review-box { border-top: 1px solid var(--line); margin-top: 8px; padding: 12px 14px; }
+  .review-box textarea, .review-box input {
+    width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+    font: inherit; margin-bottom: 8px; background: #fff;
+  }
+  .review-box textarea { min-height: 56px; resize: vertical; }
+  .btn-row { display: flex; gap: 8px; }
+  button {
+    flex: 1; border: 1px solid var(--line); background: #fff; border-radius: 6px;
+    padding: 7px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--ok); border-color: var(--ok); color: #fff; font-weight: 600; }
+  button.danger { background: #fff; border-color: var(--bad); color: var(--bad); }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+  .toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: #1f2733; color: #fff; padding: 8px 16px; border-radius: 999px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; font-size: 13px;
+  }
+  .toast.show { opacity: .94; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ToOak · 查看端</h1>
+  <span class="where" id="where"></span>
+  <span style="flex:1"></span>
+  <span class="where" id="libinfo"></span>
+</header>
+
+<main>
+  <aside>
+    <h2>项目 / 节点 / 文档</h2>
+    <div id="tree"><div class="empty" style="padding:16px">载入中…</div></div>
+  </aside>
+
+  <section class="center">
+    <h2 id="graphTitle">版本流程</h2>
+    <div id="stageBar" style="padding:0 14px 8px; display:flex; gap:6px; flex-wrap:wrap"></div>
+    <div class="graph-wrap" id="graph"><div class="empty">从左侧选择一份文档</div></div>
+  </section>
+
+  <aside>
+    <h2>详情</h2>
+    <div class="detail" id="detail"><div class="empty" style="padding:16px">尚未选择版本</div></div>
+  </aside>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const state = { doc: null, versions: [], graph: null, versionId: null, nodes: {}, role: "" };
+const STATE_LABELS = { active: "进行中", done: "已完成", on_hold: "搁置" };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+function toast(message) {
+  const box = $("toast");
+  box.textContent = message;
+  box.classList.add("show");
+  setTimeout(() => box.classList.remove("show"), 1800);
+}
+
+/* ------------------------------------------------------------------ 左侧树 */
+async function loadTree() {
+  const projects = await api("/api/projects");
+  const host = $("tree");
+  if (!projects.length) { host.innerHTML = '<div class="empty" style="padding:16px">库里还没有项目</div>'; return; }
+  host.innerHTML = "";
+  for (const project of projects) {
+    const tree = await api(`/api/projects/${project.id}/tree`);
+    const wrap = document.createElement("div");
+    const head = document.createElement("div");
+    head.className = "project-item";
+    head.textContent = `■ ${project.name}`;
+    wrap.appendChild(head);
+    const children = document.createElement("div");
+    children.className = "children";
+    tree.nodes.forEach((node) => renderNode(node, children));
+    wrap.appendChild(children);
+    host.appendChild(wrap);
+  }
+}
+
+function renderNode(node, host) {
+  const wrap = document.createElement("div");
+  const label = document.createElement("div");
+  label.className = "node-item";
+  label.textContent = `${node.documents.length ? "▸" : "·"} ${node.name}`;
+  wrap.appendChild(label);
+  if (node.documents.length) {
+    const docs = document.createElement("div");
+    docs.className = "children";
+    for (const doc of node.documents) {
+      const item = document.createElement("div");
+      item.className = "doc-item";
+      item.dataset.docId = doc.id;
+      item.innerHTML = `${esc(doc.title)}<span class="count">${doc.version_count} 版</span>`;
+      item.onclick = () => openDocument(doc.id, item);
+      docs.appendChild(item);
+    }
+    wrap.appendChild(docs);
+  }
+  (node.children || []).forEach((child) => renderNode(child, wrap));
+  host.appendChild(wrap);
+}
+
+/* --------------------------------------------------------------- 文档与图 */
+async function openDocument(docId, element) {
+  document.querySelectorAll(".doc-item").forEach((el) => el.classList.remove("active"));
+  if (element) element.classList.add("active");
+  state.role = "";
+  state.doc = await api(`/api/documents/${docId}`);
+  state.versions = await api(`/api/documents/${docId}/versions`);
+  await loadGraph();
+  state.versionId = state.doc.latest ? state.doc.latest.id : null;
+  $("where").textContent = `${state.doc.project_name} / ${state.doc.node_path} / ${state.doc.title}`;
+  renderStageBar();
+  renderDetail();
+}
+
+/* 环节栏：全部 / 输入文件 / 分析资料 / 输出文件 …（点环节看它自己的版本流程） */
+function renderStageBar() {
+  const host = $("stageBar");
+  const stages = state.doc && state.doc.stages ? state.doc.stages : [];
+  if (!stages.length) { host.innerHTML = ""; return; }
+  const all = `<span class="chip ${state.role ? "" : "on"}" data-role="">整个事件</span>`;
+  const rest = stages.map((s) =>
+    `<span class="chip ${state.role === s.role ? "on" : ""}" data-role="${s.role}">${
+      s.label}（${s.role === state.role ? state.graph.nodes.length : s.changes}）</span>`
+  ).join("");
+  host.innerHTML = all + rest;
+  host.querySelectorAll(".chip").forEach((chip) => {
+    chip.onclick = async () => {
+      state.role = chip.dataset.role || "";
+      await loadGraph();
+      renderStageBar();
+      renderDetail();
+    };
+  });
+}
+
+async function loadGraph() {
+  const docId = state.doc.id;
+  state.graph = state.role
+    ? await api(`/api/documents/${docId}/stage-graph?role=${encodeURIComponent(state.role)}`)
+    : await api(`/api/documents/${docId}/graph`);
+  renderGraph();
+}
+
+function renderGraph() {
+  const graph = state.graph;
+  const host = $("graph");
+  if (!graph || !graph.nodes.length) { host.innerHTML = '<div class="empty">这份文档还没有版本</div>'; return; }
+
+  const pad = 26;
+  const width = graph.width + pad * 2;
+  const height = graph.height + pad;
+  const nodes = {};
+  graph.nodes.forEach((node) => { nodes[node.version_id] = node; });
+  state.nodes = nodes;
+
+  const boxW = 168, boxH = 78;
+  const cx = (node) => node.x + pad;
+  const cy = (node) => node.y + 4;
+
+  let svg = `<svg class="flow" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet">`;
+  // 时间轴底线
+  svg += `<line class="axis" x1="${pad}" y1="${height - 18}" x2="${width - pad}" y2="${height - 18}" />`;
+
+  // 边
+  for (const edge of graph.edges) {
+    const from = nodes[edge.source], to = nodes[edge.target];
+    if (!from || !to) continue;
+    const x1 = cx(from) + boxW, y1 = cy(from) + boxH / 2;
+    const x2 = cx(to), y2 = cy(to) + boxH / 2;
+    const isRestore = edge.kind !== "evolution";
+    const mid = (x1 + x2) / 2;
+    const path = isRestore
+      ? `M ${x1} ${y1} C ${x1 + 40} ${y1 - 70}, ${x2 - 40} ${y2 - 70}, ${x2} ${y2}`
+      : `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`;
+    svg += `<path class="edge ${isRestore ? "restore" : ""}" d="${path}" marker-end="url(#arrow${isRestore ? "R" : ""})" />`;
+    if (edge.label) {
+      svg += `<text class="elabel" x="${mid - 6}" y="${(y1 + y2) / 2 - 6}">${esc(edge.label)}</text>`;
+    }
+  }
+  svg += `<defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#a9b4c2" /></marker>
+    <marker id="arrowR" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#c9821b" /></marker>
+  </defs>`;
+
+  // 节点
+  for (const node of graph.nodes) {
+    const selected = node.version_id === state.versionId ? "sel" : "";
+    svg += `<g class="vbox ${selected}" data-vid="${node.version_id}" transform="translate(${cx(node)},${cy(node)})">
+      <rect width="${boxW}" height="${boxH}" />
+      <text class="seq" x="12" y="20">${esc(node.label)}</text>
+      <text class="meta" x="52" y="20">${esc(node.time_text)}</text>
+      <text class="meta" x="12" y="38">${esc(node.source_name || "—")}</text>
+      <text class="meta" x="12" y="54">${esc(node.state_label || node.review_label)} · ${esc(node.role_label || node.origin_label)}${node.is_current ? " · 当前" : ""}</text>
+      <text class="change" x="12" y="69">${esc(node.change_summary)}</text>
+    </g>`;
+  }
+  svg += "</svg>";
+  host.innerHTML = svg;
+  host.querySelectorAll(".vbox").forEach((item) => {
+    item.onclick = () => { state.versionId = Number(item.dataset.vid); renderGraph(); renderDetail(); };
+  });
+}
+
+/* --------------------------------------------------------------- 版本详情 */
+async function renderDetail() {
+  const host = $("detail");
+  if (!state.versionId) { host.innerHTML = '<div class="empty" style="padding:16px">尚未选择版本</div>'; return; }
+  const version = await api(`/api/versions/${state.versionId}`);
+  const index = state.versions.findIndex((item) => item.id === state.versionId);
+  const previous = index > 0 ? state.versions[index - 1] : null;
+
+  let diffHtml = "";
+  if (previous) {
+    try {
+      const diff = state.role
+        ? await api(`/api/documents/${state.doc.id}/stage-diff?a=${previous.id}&b=${version.id}&role=${encodeURIComponent(state.role)}`)
+        : await api(`/api/diff?a=${previous.id}&b=${version.id}`);
+      const lines = (diff.unified || "").split("\n").map((line) => {
+        const cls = line.startsWith("+") && !line.startsWith("+++") ? "add"
+          : line.startsWith("-") && !line.startsWith("---") ? "del"
+          : line.startsWith("@@") ? "hunk" : "";
+        return `<span class="${cls}">${esc(line)}</span>`;
+      }).join("\n");
+      diffHtml = `<h2>与 ${esc(previous.label)} 比较</h2>
+        <div style="padding:0 14px 6px;color:var(--muted);font-size:12px">${esc(diff.summary)}</div>`;
+      if (diff.details && diff.details.length) {
+        diffHtml += `<div class="detail" style="padding-top:0;font-size:12px;color:var(--muted)">`
+          + diff.details.map((d) => `· ${esc(d)}`).join("<br>") + `</div>`;
+      }
+      if (diff.unified) diffHtml += `<div style="padding:0 14px 12px"><pre class="diff">${lines}</pre></div>`;
+    } catch (error) { diffHtml = ""; }
+  }
+
+  host.innerHTML = `
+    <div class="detail">
+      <h2 style="margin-left:0">${esc(version.label)}
+        <span class="badge ${state.doc.state}">${esc(state.doc.state_label)}</span>
+        ${state.role ? `<span class="badge">${esc(version.role_label || state.role)}</span>` : ""}
+      </h2>
+      <dl class="kv">
+        <dt>归档时间</dt><dd>${esc(version.time_text)}</dd>
+        <dt>归档人</dt><dd>${esc(version.author || "—")}</dd>
+        <dt>来源</dt><dd>${esc(version.origin)}</dd>
+        <dt>主文件</dt><dd>${esc(version.source_name || "—")}</dd>
+        <dt>大小</dt><dd>${esc(version.size_text)}</dd>
+        <dt>指纹</dt><dd>${esc(version.short_sha)}</dd>
+        ${version.profile && version.profile.detail ? `<dt>类型</dt><dd>${esc(version.profile.detail)}</dd>` : ""}
+        ${version.note ? `<dt>备注</dt><dd>${esc(version.note)}</dd>` : ""}
+      </dl>
+      <h2 style="margin-left:0">文件（${version.files.length}）</h2>
+      <ul class="files">
+        ${version.files.map((file) => `<li>
+            <span>${esc(file.name)} <span class="role">${esc(file.role_label || file.role)}</span></span>
+            <span class="role">${esc(file.size_text)}</span></li>`).join("")}
+      </ul>
+      <div style="margin:0 0 8px"><a href="/api/versions/${version.id}/content" style="color:var(--accent)">下载主文件</a></div>
+      <h2 style="margin-left:0">审阅记录（${version.reviews.length}）</h2>
+      <div style="font-size:12.5px;color:var(--muted)">
+        ${version.reviews.length ? version.reviews.map((r) =>
+          `· ${esc(r.reviewer || "匿名")} ${esc(r.decision)} ${esc(r.comment)} <span style="opacity:.7">${esc((r.created_at || "").slice(0, 16).replace("T", " "))}</span>`
+        ).join("<br>") : "暂无"}
+      </div>
+    </div>
+    ${diffHtml}
+    <div class="review-box">
+      <h2 style="margin:0 0 8px">状态</h2>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:6px">
+        这是你自己的进度标记，不是审批结论，随时可以改。
+      </div>
+      <div class="btn-row">
+        <button class="${state.doc.state === "active" ? "primary" : ""}" onclick="submitState('active')">进行中</button>
+        <button class="${state.doc.state === "done" ? "primary" : ""}" onclick="submitState('done')">已完成</button>
+        <button class="${state.doc.state === "on_hold" ? "primary" : ""}" onclick="submitState('on_hold')">搁置</button>
+      </div>
+      <h2 style="margin:12px 0 8px">备注</h2>
+      <textarea id="comment" placeholder="记一句：这一稿为什么是这样、下次要改什么…"></textarea>
+      <div class="btn-row"><button class="primary" onclick="submitNote()">记录备注</button></div>
+    </div>`;
+}
+
+async function submitState(value) {
+  try {
+    state.doc = await api(`/api/documents/${state.doc.id}/state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state: value }),
+    });
+    toast(`状态已设为「${STATE_LABELS[value] || value}」`);
+    await loadTree();
+    renderDetail();
+  } catch (error) { toast(`失败：${error.message}`); }
+}
+
+async function submitNote() {
+  const note = $("comment").value.trim();
+  if (!note) { toast("备注是空的"); return; }
+  try {
+    await api(`/api/versions/${state.versionId}/note`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    });
+    toast("备注已记录");
+    state.versions = await api(`/api/documents/${state.doc.id}/versions`);
+    renderDetail();
+  } catch (error) { toast(`失败：${error.message}`); }
+}
+
+/* -------------------------------------------------------------------- 启动 */
+(async function boot() {
+  try {
+    const health = await api("/api/health");
+    $("libinfo").textContent = `库「${health.library}」· ${health.counts.documents} 文档 / ${health.counts.versions} 版本`;
+    await loadTree();
+  } catch (error) {
+    $("tree").innerHTML = `<div class="empty" style="padding:16px">载入失败：${esc(error.message)}</div>`;
+  }
+})();
+</script>
+</body>
+</html>
