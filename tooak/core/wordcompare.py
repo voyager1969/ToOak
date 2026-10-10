@@ -36,6 +36,7 @@ Word 起不来是因为它的用户配置目录写不进去，这种现象必须
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import subprocess
@@ -49,10 +50,13 @@ from .util import safe_filename, unique_path
 
 __all__ = [
     "WORD_EXTS",
+    "ENGINES",
     "WordCompareError",
     "WordCompareResult",
     "is_word_file",
     "available",
+    "engines",
+    "engine_label",
     "unavailable_reason",
     "script_text",
     "compare",
@@ -75,13 +79,45 @@ _WD_GRANULARITY_WORD = 1
 #: 默认超时：Word 首次启动 + 大文档比较，给足时间
 DEFAULT_TIMEOUT = 300.0
 
-#: ``CompareDocuments`` 的完整位置参数（除前四个之外都是"要不要比这些"的开关）。
+#: ``CompareDocuments`` 的开关参数（除前四个之外都是"要不要比这些"）。
 #: 顺序照 VBA 的签名：Destination, Granularity, CompareFormatting, CompareCaseChanges,
 #: CompareWhitespace, CompareTables, CompareHeaders, CompareFootnotes, CompareTextboxes,
-#: CompareFields, CompareComments, CompareMoves, RevisedAuthor。
+#: CompareFields, CompareComments, CompareMoves。
 #: **格式默认不比**（CompareFormatting=False）：写论文/报告时"整段重新排了一下版"
 #: 会把修订标记糊满整页，把真正的文字改动淹掉。
-_COMPARE_FLAGS = "$false, $false, $false, $true, $true, $true, $true, $true, $true, $true"
+_COMPARE_FLAGS = (False, False, False, True, True, True, True, True, True, True)
+
+#: 引擎候选（COM ProgID → 声明的种类 → 给用户看的名字）。
+#: **顺序是"自动模式下的优先顺序"**：先 Word，再 WPS。
+#:
+#: 为什么还要按注册表核对（见 ``_probe``）：WPS 装过之后会把自己的 CLSID 挂到
+#: ``Word.Application`` 上（"接管"这个入口），于是 `New-Object -ComObject Word.Application`
+#: 起起来的其实是 WPS —— 而它在 `Documents.CompareDocuments` 上的签名与 Word 不同，
+#: 这正是用户遇到的「找不到 CompareDocuments 的重载，参数计数为 15」的来源之一。
+#: 用户后来还发现了另一半问题："我电脑上 Wps 和 Word 都有，**显示用 Word 比较，
+#: 所以这里按**注册表实际指向的 exe** 决定顺序与名字，而不是看 ProgID 叫什么。
+ENGINES: tuple[tuple[str, str, str], ...] = (
+    ("word", "Word.Application", "Microsoft Word"),
+    ("wps", "KWPS.Application", "WPS 文字"),
+    ("wps", "WPS.Application", "WPS 文字"),
+)
+
+
+def _kind_of_exe(exe: str, declared: str) -> str:
+    """按 exe 文件名认这是哪一家（认不出来就用声明的种类）。
+
+    ``WINWORD.EXE`` → Word；路径里带 ``wps`` / ``kingsoft`` / ``金山`` → WPS。
+    这一步是"菜单上写的名字对不对"的关键：装了 WPS 的机器上 ``Word.Application``
+    很可能指向 ``wps.exe``，只看 ProgID 就会把 WPS 报成 Word。
+    """
+    name = str(exe or "").lower()
+    if not name:
+        return declared
+    if "winword" in name:
+        return "word"
+    if "wps" in name or "kingsoft" in name or "金山" in name:
+        return "wps"
+    return declared
 
 
 class WordCompareError(RuntimeError):
@@ -98,18 +134,35 @@ class WordCompareError(RuntimeError):
 
 @dataclass
 class WordCompareResult:
-    """一次 Word 比较的结果。"""
+    """一次比较的结果。"""
 
     output: Path
-    #: Word 数出来的修订条数（界面上"共 N 处修订"）
+    #: 程序数出来的修订条数（界面上"共 N 处修订"）
     revisions: int = 0
     #: 比较用的两份文件（原文 / 改后），只用来写提示
     original: Path | None = None
     revised: Path | None = None
-    #: Word 是不是被留着打开（界面上那份带修订的红头文件）
+    #: 是不是被留着打开（界面上那份带修订的红头文件）
     shown: bool = False
     seconds: float = 0.0
+    #: 这次是**谁**干的：``"word"`` / ``"wps"`` / ``""``（未知）
+    engine_kind: str = ""
+    #: 程序自己报的名字与可执行文件（"Microsoft Word"、"…\WINWORD.EXE"）
+    engine_name: str = ""
+    engine_path: str = ""
     details: list[str] = field(default_factory=list)
+
+    @property
+    def engine_label(self) -> str:
+        """界面上怎么写这次用的程序（取不到就按 kind 兜底）。"""
+        if self.engine_name:
+            return self.engine_name
+        return {"word": "Word", "wps": "WPS 文字"}.get(self.engine_kind, "Word / WPS")
+
+    @property
+    def kind_label(self) -> str:
+        """短名字（状态栏用）：``Word`` / ``WPS``。"""
+        return {"word": "Word", "wps": "WPS"}.get(self.engine_kind, "") or "Word / WPS"
 
 
 def is_word_file(name: str | Path) -> bool:
@@ -122,58 +175,254 @@ def is_word_file(name: str | Path) -> bool:
 # ---------------------------------------------------------------------------
 
 _AVAILABLE: bool | None = None
+#: 探到的引擎（``(kind, ProgID, 名字)`` 列表，按会实际使用的顺序）。注册表结果缓存。
+_ENGINES_FOUND: list[tuple[str, str, str]] | None = None
 
 
-def available(refresh: bool = False) -> bool:
-    """本机能不能用 Word 的 COM 接口（Windows + Word 已注册 COM 服务器）。
+def _probe() -> list[tuple[str, str, str]]:
+    """按注册表算出"这台机器能用哪个程序做比较、按什么顺序试"，返回
+    ``[(kind, ProgID, 名字), …]``。
 
-    只看**注册表里有没有 ``Word.Application``**：这一步是毫秒级的，可以放心
-    在右键菜单弹出时调用；真的去 New-Object 起一次 Word 要十几秒，那件事
-    放在后台线程里做，失败了再说（见 :func:`compare`）。
 
-    结果缓存：注册表不会在程序运行期间变。
+    * **哪个 ProgID 用哪个 CLSID，要按 COM 的规矩来**：先看 ``ProgID\\CLSID``，
+      没有再跟 ``CurVer``。以前这里是反的（先 CurVer），于是"装过 WPS、它接管了
+      ``Word.Application``"的机器上，探测看到的是 Word 的版本化 ProgID、
+      报"能用 Word"，而 COM 真正起的是 WPS —— 用户看到的正是
+      "显示用 Word 比较，打开后当时用的 wps 比较的"。
+    * **指向哪个 exe 才算哪一家**：``WINWORD.EXE`` 才是 Word；路径里有 wps 的是 WPS。
+    * **Word 优先，而且被接管时也要真的用上 Word**：``Word.Application`` 被别人
+      接管时，Word 自己的版本化 ProgID（``CurVer`` 指的那个）往往还指着 WINWORD.EXE，
+      把它作为候选排在前面 —— 这样菜单写"用 Word 比较"、点下去也确实是 Word。
+    * 只保留 **exe 真的存在** 的那些（卸载残留的半截注册表项不算数）。
     """
-    global _AVAILABLE
-    if _AVAILABLE is not None and not refresh:
-        return _AVAILABLE
-    _AVAILABLE = _probe()
-    return _AVAILABLE
-
-
-def _probe() -> bool:
     if sys.platform != "win32":
-        return False
+        return []
     try:
         import winreg
     except ImportError:                     # pragma: no cover - 非 Windows 不会走到
-        return False
-    for hive, key in (
-        (winreg.HKEY_CLASSES_ROOT, r"Word.Application\CurVer"),
-        (winreg.HKEY_CLASSES_ROOT, r"Word.Application\CLSID"),
-    ):
+        return []
+
+    found: list[tuple[str, str, str]] = []
+    seen_prog: set[str] = set()
+
+    def add(kind: str, prog_id: str) -> None:
+        """能用的判据：ProgID 注册过（有 CLSID 或 CurVer）**或者**本机能找到它的 exe。
+
+        为什么不能只认 "CLSID → LocalServer32 → exe"：**WPS 就没有 LocalServer32**
+        （实测它的 ``KWPS.Application\\CLSID`` 是 ``{000209FF-0000-4b30-A977-…}``，
+        里面没有 LocalServer32 / InprocServer32 / LocalServer 任何一个），
+        只按那条路走就会把一台明明装着 WPS 的机器报成"没有 WPS"。
+        """
+        exe = _server_exe(winreg, prog_id) or _installed_exe(kind)
+        registered = _registered(winreg, prog_id)
+        if not exe and not registered:
+            return
+        real_kind = _kind_of_exe(exe, kind)
+        label = "Microsoft Word" if real_kind == "word" else "WPS 文字"
+        key = prog_id.lower()
+        if key in seen_prog:
+            return
+        seen_prog.add(key)
+        found.append((real_kind, prog_id, label))
+
+    # ① 通用入口（实际是谁，按它自己的 CLSID 说话）
+    generic_exe = _server_exe(winreg, "Word.Application")
+    generic_kind = _kind_of_exe(generic_exe, "word")
+    if generic_kind == "word":
+        add("word", "Word.Application")
+    else:
+        # ② 通用入口被 WPS 接管了：把版本化的 Word ProgID（CurVer 那个）补进来 ——
+        # 它往往还指着 WINWORD.EXE，**那才是真 Word**。这样菜单写"用 Word 比较"、
+        versioned = _curver(winreg, "Word.Application")
+        if versioned and versioned.lower() != "word.application":
+            add("word", versioned)
+        # ③ 被接管的那一刻，通用入口本身就是能用的 WPS，排在真 Word 后面
+        add("wps", "Word.Application")
+    # ④ WPS 自己的 ProgID
+    for kind, prog_id, _label in ENGINES[1:]:
+        add(kind, prog_id)
+    return found
+
+
+def _registered(winreg, prog_id: str) -> bool:
+    """这个 ProgID 注册过没有（有 ``CLSID`` 或 ``CurVer`` 就算，看默认值没用 ——
+    默认值是一句描述文字，比如 "WPS Writer Application Class"）。"""
+    for path in (rf"{prog_id}\CLSID", rf"{prog_id}\CurVer", prog_id):
         try:
-            with winreg.OpenKey(hive, key):
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, path):
                 return True
         except OSError:
             continue
     return False
 
 
+#: 常见的安装位置（注册表查不到 exe 时按这个找）。
+#: 为什么要有它：WPS 的 CLSID 里没有 LocalServer32，能找到 wps.exe 就够我们
+#: 判断"这台机器能用 WPS、而且它在哪个目录" —— 菜单上写的名字、回话里的说明都靠它。
+_INSTALL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "word": (
+        r"%ProgramFiles%\Microsoft Office\root\Office*\WINWORD.EXE",
+        r"%ProgramFiles(x86)%\Microsoft Office\root\Office*\WINWORD.EXE",
+        r"%ProgramFiles%\Microsoft Office\Office*\WINWORD.EXE",
+        r"%ProgramFiles(x86)%\Microsoft Office\Office*\WINWORD.EXE",
+    ),
+    "wps": (
+        r"%LOCALAPPDATA%\Kingsoft\WPS Office\*\office6\wps.exe",
+        r"%APPDATA%\Kingsoft\WPS Office\*\office6\wps.exe",
+        r"%ProgramFiles%\Kingsoft\WPS Office\*\office6\wps.exe",
+        r"%ProgramFiles(x86)%\Kingsoft\WPS Office\*\office6\wps.exe",
+        r"%ProgramFiles%\WPS Office\*\office6\wps.exe",
+    ),
+}
+
+
+def _installed_exe(kind: str) -> str:
+    """按常见安装位置找这个程序的 exe（取第一个存在的）；找不到返回空串。"""
+    for pattern in _INSTALL_PATTERNS.get(kind, ()):
+        expanded = os.path.expandvars(pattern)
+        if "%" in expanded:                # 环境变量没定义（比如 32 位的 ProgramFiles(x86)）
+            continue
+        for hit in sorted(glob.glob(expanded), reverse=True):   # 版本号大的优先
+            if Path(hit).is_file():
+                return hit
+    return ""
+
+
+def _curver(winreg, prog_id: str) -> str:
+    """``ProgID\\CurVer`` 指的版本化 ProgID（没有就空串）。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\CurVer") as key:
+            value, _kind = winreg.QueryValueEx(key, "")
+            return str(value or "")
+    except OSError:
+        return ""
+
+
+def _server_exe(winreg, prog_id: str) -> str:
+    """这个 ProgID 实际会启动哪个 exe（注册表 ``LocalServer32``）；取不到返回空串。
+
+    找 CLSID 的顺序**照 COM 的规矩**：先 ``ProgID\\CLSID``（``CLSIDFromProgID`` 就是
+    先看它），没有再跟 ``CurVer`` 到版本化 ProgID 去要。反过来会让"被 WPS 接管的
+    """
+    clsid = ""
+    for name in (prog_id, _curver(winreg, prog_id)):
+        if not name:
+            continue
+        for path in (rf"{name}\CLSID", name):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, path) as key:
+                    value, _kind = winreg.QueryValueEx(key, "")
+                    if value and str(value).startswith("{"):
+                        clsid = str(value)
+                        break
+            except OSError:
+                continue
+        if clsid:
+            break
+    if not clsid:
+        return ""
+
+    for sub in ("LocalServer32", "InprocServer32"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}\{sub}") as key:
+                value, _kind = winreg.QueryValueEx(key, "")
+                return _exe_from_command(str(value or ""))
+        except OSError:
+            continue
+    return ""
+
+
+def _exe_from_command(command: str) -> str:
+    """把 ``"C:\\…\\WINWORD.EXE" /Automation`` 里的 exe 抠出来。"""
+    text = command.strip()
+    if not text:
+        return ""
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        return text[1:end] if end > 0 else text.strip('"')
+    return text.split(" /")[0].split(" -")[0].strip()
+
+
+def engines(refresh: bool = False) -> list[tuple[str, str, str]]:
+    """这台机器能用哪些程序做比较，按**会实际使用的顺序**：
+    ``[("word", "Word.Application", "Microsoft Word"), …]``。
+
+    结果缓存：注册表不会在程序运行期间变（``refresh=True`` 强制重查）。
+    """
+    global _ENGINES_FOUND
+    if _ENGINES_FOUND is None or refresh:
+        _ENGINES_FOUND = _probe()
+    return list(_ENGINES_FOUND)
+
+
+def available(refresh: bool = False) -> bool:
+    """本机能不能用 Word / WPS 的比较功能（Windows + 有注册好的 COM 服务器）。"""
+    global _AVAILABLE
+    if _AVAILABLE is not None and not refresh:
+        return _AVAILABLE
+    found = engines(refresh=refresh)
+    _AVAILABLE = bool(found)
+    return _AVAILABLE
+
+
+def engine_label() -> str:
+    """界面上写哪一个名字：**按真正会用的那一个**写。
+
+    只认 ``engines()`` 的第一个（那就是脚本会先用、也最可能成功的那个）：
+    "显示用 Word 比较，打开后当时用的 wps 比较的"这种对不上。
+    """
+    found = engines()
+    if not found:
+        return ""
+    kinds = {kind for kind, _prog, _label in found}
+    first_kind = found[0][0]
+    if kinds == {"word"}:
+        return "Word"
+    if kinds == {"wps"}:
+        return "WPS 文字"
+    return "Word" if first_kind == "word" else "WPS 文字"
+
+
+def engine_progids() -> list[str]:
+    """交给脚本的 ProgID 候选顺序（``;`` 分隔），脚本照这个顺序试。"""
+    return [prog for _kind, prog, _label in engines()]
+
+
+def engine_hint() -> str:
+    """菜单提示里那句"会用谁比、不行会换谁"。
+
+    先用的那个就是菜单标题写的那一个，后面的是备选。
+    """
+    found = engines()
+    if not found:
+        return ""
+    labels: list[str] = []
+    for _kind, _prog, label in found:
+        if label not in labels:
+            labels.append(label)
+    if len(labels) == 1:
+        return f"用本机的 {labels[0]} 比较"
+    return (f"优先用 {labels[0]}；它起不来或正忙时会自动换 {' / '.join(labels[1:])}"
+            "（比完会在状态栏里写明这次是谁比的）")
+
+
 def unavailable_reason() -> str:
-    """用不了 Word 时，一句能写进菜单提示的人话。"""
+    """用不了时，一句能写进菜单提示的人话。"""
     if sys.platform != "win32":
-        return "Word 比较只在 Windows 上可用（需要本机安装 Microsoft Word）"
-    return ("没有找到 Microsoft Word：这一项要调用本机 Word 的"
-            "「审阅 → 比较」功能，装好 Word 之后这里就能点了")
+        return "Word 比较只在 Windows 上可用（需要本机安装 Microsoft Word 或 WPS）"
+    return ("没有找到 Microsoft Word，也没有找到 WPS：这一项要调用本机程序的"
+            "「审阅 → 比较」功能，装好 Word 或 WPS 之后这里就能点了")
 
 
 # ---------------------------------------------------------------------------
 # PowerShell 脚本（**纯 ASCII**，路径走环境变量）
 # ---------------------------------------------------------------------------
 
-#: 脚本里给 Python 看的回话格式（stdout 一行）
+#: 脚本里给 Python 看的回话格式（stdout 一行 + 报告文件）
 _OK_MARK = "TOOAK-OK"
 _ERR_MARK = "TOOAK-ERR"
+#: 回话的第二行：这次是拿哪个程序比的（``kind|名字|exe 路径``）
+_ENGINE_MARK = "TOOAK-ENGINE"
 
 _SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
@@ -189,8 +438,9 @@ function Get-EnvText([string]$name) {
 # —— 走 stdout 就得赌编码。写文件时显式指定 UTF-8，这边就与代码页无关了。
 function Write-Report([string]$text) {
     try {
-        [System.IO.File]::WriteAllText(
-            $reportPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::AppendAllText(
+            $reportPath, $text + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
     Write-Output $text
 }
@@ -201,64 +451,229 @@ $outPath  = Get-EnvText 'TOOAK_WORD_OUT'
 $reportPath = Get-EnvText 'TOOAK_WORD_REPORT'
 $author   = Get-EnvText 'TOOAK_WORD_AUTHOR'
 $keepOpen = (Get-EnvText 'TOOAK_WORD_VISIBLE') -eq '1'
+$prefer   = (Get-EnvText 'TOOAK_WORD_ENGINE').ToLower()
 
 if (-not $origPath -or -not $revPath -or -not $outPath) {
     Write-Report 'TOOAK-ERR missing TOOAK_WORD_ORIG / TOOAK_WORD_REV / TOOAK_WORD_OUT'
     exit 2
 }
+if (-not $author) { $author = 'ToOak' }
 
-$word = $null
+# 报告文件是**追加**写的（每次调用先由 Python 删掉旧的），所以这里先清空
+try { [System.IO.File]::WriteAllText($reportPath, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+
+# 要比哪些东西：格式、字母大小写、空白都不比（整段重排版会把修订标记糊满整页，
+# 把真正的文字改动淹掉），表格 / 页眉页脚 / 脚注 / 文本框 / 域 / 批注 / 移动都比。
+$flags = @($false, $false, $false, $true, $true, $true, $true, $true, $true, $true)
+
+# 晚绑定调用：**这是这一版最关键的一行**。
+# PowerShell 对 COM 会拿类型库去挑重载，参数个数对不上就直接报
+#   「找不到"CompareDocuments"的重载，参数计数为:"15"」
+# —— 因为 Word 2013+ 那个方法有 **16** 个参数（末尾多一个 IgnoreAllComparisonWarnings），
+# 而按 VBA 老文档数出来的只有 15 个。改走 InvokeMember 就是把参数原样交给 IDispatch，
+# 让程序自己去补可选参数：参数个数不再需要"正好对上某个重载"。
+function Invoke-Late([object]$target, [string]$method, [object[]]$arguments) {
+    return $target.GetType().InvokeMember(
+        $method, [System.Reflection.BindingFlags]::InvokeMethod,
+        $null, $target, $arguments)
+}
+
+# 按参数个数**由长到短**试：Word 2013+ 16 个 / 2007-2010 15 个 / 更早 13 个 /
+# 最后兜底只给两个必填的，其余交给程序默认。
+function Compare-Documents([object]$app, [object]$orig, [object]$rev) {
+    $base = @($orig, $rev, __DEST__, __GRAN__)
+    $sets = @(
+        ($base + $flags + @($author, $true)),
+        ($base + $flags + @($author)),
+        ($base + $flags + @($true)),
+        ($base + $flags[0..7] + @($author)),
+        @($orig, $rev)
+    )
+    $last = ''
+    foreach ($arguments in $sets) {
+        try { return (Invoke-Late $app.Documents 'CompareDocuments' $arguments) }
+        catch { $last = $_.Exception.Message }
+    }
+    throw ('CompareDocuments 失败：' + $last)
+}
+
+# 备选路：老 API ``Document.Compare(对方路径)`` —— 把修订合并进**当前这份文档**。
+# Word 2000 起就有，WPS 也认；我们在**临时副本**上做，所以既不碰用户的原文件，
+# 也不碰库里那份。
+function Compare-InPlace([object]$doc, [string]$against) {
+    $sets = @(
+        @($against, $author, 1, $false),
+        @($against, $author),
+        @($against)
+    )
+    $last = ''
+    foreach ($arguments in $sets) {
+        try {
+            Invoke-Late $doc 'Compare' $arguments | Out-Null
+            return
+        } catch { $last = $_.Exception.Message }
+    }
+    throw ('Document.Compare 失败：' + $last)
+}
+
+# 引擎候选：**由 Python 那边按注册表算好、通过环境变量给进来**
+# （顺序就是"会先用哪个"；装了 WPS 的机器上 Word.Application 很可能被它接管，
+#  所以这里不能写死 —— 见 wordcompare._probe）。
+$order = @()
+foreach ($prog in ((Get-EnvText 'TOOAK_WORD_ENGINES') -split ';')) {
+    $clean = $prog.Trim()
+    if ($clean) { $order += @{ kind = ''; prog = $clean } }
+}
+if ($order.Count -eq 0) {
+    # 没给（手工跑脚本、或探测失败）：退回最常见的三个
+    $order = @(
+        @{ kind = 'word'; prog = 'Word.Application' },
+        @{ kind = 'wps';  prog = 'KWPS.Application' },
+        @{ kind = 'wps';  prog = 'WPS.Application' }
+    )
+}
+if ($prefer -eq 'wps') { $order = @($order | Where-Object { $_ -match 'wps' }) + @($order | Where-Object { $_ -notmatch 'wps' }) }
+
+# "目标程序正忙"这一类错误：等一会儿重试**同一个引擎**，而不是立刻换下一个。
+# 为什么重要：Word 还开着别的文档、页面上有个模态框、上一个自动化实例还没就绪时，
+# COM 会回 RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER。这时候直接换引擎，
+# 用户就会看到"菜单写的是 Word，结果 WPS 打开了"（他报过这个）——
+# 那不是真不行，只是没等它。
+function Test-Busy([string]$text) {
+    return ($text -match '(?i)0x80010001|0x8001010A|rejected|busy|retrylater|被拒绝|忙')
+}
+
+$app = $null
 $orig = $null
 $rev = $null
 $cmp = $null
+$tmpPath = ''
 $revisions = -1
 $failure = ''
+$engineKind = ''
+$engineName = ''
+$enginePath = ''
 
-try {
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = 0
-    # ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False
-    # ReadOnly 很关键：原文件绝不会因为"比一次"而被改到或锁住。
-    $orig = $word.Documents.Open($origPath, $false, $true, $false)
-    $rev = $word.Documents.Open($revPath, $false, $true, $false)
-    if ($author) {
-        $cmp = $word.CompareDocuments($orig, $rev, __DEST__, __GRAN__, __FLAGS__, $author)
-    } else {
-        $cmp = $word.CompareDocuments($orig, $rev, __DEST__, __GRAN__, __FLAGS__)
+$done = $false
+foreach ($candidate in $order) {
+    if ($done) { break }
+    # 同一个引擎最多试 3 次（第 2、3 次是"它刚才正忙"）
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $failure = ''
+        try {
+            $app = New-Object -ComObject $candidate.prog
+        } catch {
+            $busy = Test-Busy $_.Exception.Message
+            $failure = '起不了 ' + $candidate.prog + '：' + $_.Exception.Message
+            if ($busy -and $attempt -lt 3) { Start-Sleep -Milliseconds 2000; continue }
+            break                        # 换下一个引擎
+        }
+        try {
+            try { $engineName = [string]$app.Name } catch { $engineName = '' }
+            try { $enginePath = [string]$app.Path } catch { $enginePath = '' }
+            $engineKind = $candidate.kind
+            if (-not $engineKind) {
+                if ($candidate.prog -match '(?i)wps') { $engineKind = 'wps' } else { $engineKind = 'word' }
+            }
+            # ProgID 写着 Word 但实际是 WPS 在干活：如实报成 wps（这是用户报过的那件事）
+            if (($enginePath + $engineName) -match '(?i)wps|kingsoft|金山') { $engineKind = 'wps' }
+            if (($enginePath + $engineName) -match '(?i)winword') { $engineKind = 'word' }
+            $app.Visible = $false
+            $app.DisplayAlerts = 0
+            # ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False
+            # ReadOnly 很关键：原文件绝不会因为"比一次"而被改到或锁住。
+            $orig = $app.Documents.Open($origPath, $false, $true, $false)
+            $rev = $app.Documents.Open($revPath, $false, $true, $false)
+            $cmp = $null
+            $firstError = ''
+            try {
+                $cmp = Compare-Documents $app $orig $rev
+                $cmp.SaveAs2($outPath, __FORMAT__)
+                $revisions = $cmp.Revisions.Count
+                $done = $true
+            } catch {
+                # 这条路不行（比如 WPS 没实现 CompareDocuments）：换老 API 在临时副本上比
+                $firstError = $_.Exception.Message
+                try { if ($orig) { $orig.Close(0) } } catch { }
+                try { if ($rev) { $rev.Close(0) } } catch { }
+                $orig = $null
+                $rev = $null
+                $tmpPath = [System.IO.Path]::Combine(
+                    [System.IO.Path]::GetTempPath(),
+                    ('tooak-cmp-' + [System.Guid]::NewGuid().ToString('N') + '.docx'))
+                Copy-Item -LiteralPath $revPath -Destination $tmpPath -Force
+                $rev = $app.Documents.Open($tmpPath, $false, $false, $false)
+                try {
+                    Compare-InPlace $rev $origPath
+                    $revisions = $rev.Revisions.Count
+                    $rev.SaveAs2($outPath, __FORMAT__)
+                    $cmp = $rev
+                    $done = $true
+                } catch {
+                    # 两条路都不行：**两句话都留着**（只说后半句会把原因指偏）
+                    $failure = $firstError + ' / ' + $_.Exception.Message
+                }
+            }
+        } catch {
+            $failure = $_.Exception.Message
+        }
+        if ($done) { break }
+        # 收摊：留着半开的文档会占住用户的文件
+        try { if ($cmp) { $cmp.Close(0) } } catch { }
+        try { if ($orig) { $orig.Close(0) } } catch { }
+        try { if ($rev -and $rev -ne $cmp) { $rev.Close(0) } } catch { }
+        try { if ($app) { $app.Quit() } } catch { }
+        $app = $null
+        $orig = $null
+        $rev = $null
+        $cmp = $null
+        if ($tmpPath) { try { Remove-Item -LiteralPath $tmpPath -Force } catch { } $tmpPath = '' }
+        if ((Test-Busy $failure) -and $attempt -lt 3) {
+            Start-Sleep -Milliseconds 2000
+            continue                     # 同一个引擎再试一次
+        }
+        break                            # 换下一个引擎
     }
-    $cmp.SaveAs2($outPath, __FORMAT__)
-    $revisions = $cmp.Revisions.Count
-} catch {
-    $failure = $_.Exception.Message
 }
 
-if ($failure -eq '') {
+if ($revisions -ge 0 -and $app) {
+    # 结果文件另存之后才是用户要看的东西：让 Word 打开**结果文件**（不是临时副本）
     if ($keepOpen) {
-        # 用户要的就是"在 Word 里看那份带修订的文件"：留着它，别关。
-        try { $word.Visible = $true } catch { }
-        try { $cmp.Activate() } catch { }
+        try {
+            $shown = $app.Documents.Open($outPath, $false, $true, $false)
+            if ($cmp -and ($tmpPath -ne '') -and ($cmp.FullName -ne $shown.FullName)) {
+                try { $cmp.Close(0) } catch { }
+            }
+            try { $shown.Activate() } catch { }
+        } catch { }
+        try { $app.Visible = $true } catch { }
+        try { if ($orig) { $orig.Close(0) } } catch { }
         Write-Report ('TOOAK-OK ' + $revisions + ' 1')
+        Write-Report ('TOOAK-ENGINE ' + $engineKind + '|' + $engineName + '|' + $enginePath)
+        if ($tmpPath) { try { Remove-Item -LiteralPath $tmpPath -Force } catch { } }
         exit 0
     }
-    try { $cmp.Close(0) } catch { }
-    try { $orig.Close(0) } catch { }
-    try { $rev.Close(0) } catch { }
-    try { $word.Quit() } catch { }
+    try { if ($cmp) { $cmp.Close(0) } } catch { }
+    try { if ($orig) { $orig.Close(0) } } catch { }
+    try { if ($rev -and $rev -ne $cmp) { $rev.Close(0) } } catch { }
+    try { $app.Quit() } catch { }
+    if ($tmpPath) { try { Remove-Item -LiteralPath $tmpPath -Force } catch { } }
     Write-Report ('TOOAK-OK ' + $revisions + ' 0')
+    Write-Report ('TOOAK-ENGINE ' + $engineKind + '|' + $engineName + '|' + $enginePath)
     exit 0
 }
 
-# 失败：能关的都关掉，别在后台留一个看不见的 Word 进程占着文档
+# 全都失败了：能关的都关掉，别在后台留一个看不见的进程占着文档
 try { if ($cmp) { $cmp.Close(0) } } catch { }
 try { if ($orig) { $orig.Close(0) } } catch { }
-try { if ($rev) { $rev.Close(0) } } catch { }
-try { if ($word) { $word.Quit() } } catch { }
+try { if ($rev -and $rev -ne $cmp) { $rev.Close(0) } } catch { }
+try { if ($app) { $app.Quit() } } catch { }
+if ($tmpPath) { try { Remove-Item -LiteralPath $tmpPath -Force } catch { } }
+if (-not $failure) { $failure = 'Word 与 WPS 都没能完成比较（都装了吗？）' }
 Write-Report ('TOOAK-ERR ' + $failure)
 exit 1
 """.replace("__DEST__", str(_WD_COMPARE_DEST_NEW)) \
    .replace("__GRAN__", str(_WD_GRANULARITY_WORD)) \
-   .replace("__FLAGS__", _COMPARE_FLAGS) \
    .replace("__FORMAT__", str(_WD_FORMAT_DOCX))
 
 
@@ -295,19 +710,22 @@ def compare(
     author: str = "ToOak",
     show: bool = True,
     timeout: float = DEFAULT_TIMEOUT,
+    engine: str = "",
 ) -> WordCompareResult:
-    """用 Word 比较两份文档，把**带修订标记的结果**存成一份新 docx。
+    """用 Word（或 WPS）比较两份文档，把**带修订标记的结果**存成一份新 docx。
 
-    :param original: 旧的那一份（Word 里的"原始文档"）
+    :param original: 旧的那一份（"原始文档"）
     :param revised: 新的那一份（"修订的文档"）
     :param output: 结果存哪；不给就用 :func:`suggest_output_path`
-    :param author: 修订标记挂在谁名下（Word 默认是当前用户名，这里写清是 ToOak 生成的）
-    :param show: True = 比较完把 Word 留着打开给用户看（界面默认）；
-        False = 存完就关掉 Word（测试 / 无人值守用）
-    :raises WordCompareError: 没装 Word、起不来、文档打不开、超时……一律带人话
+    :param author: 修订标记挂在谁名下（程序默认是当前用户名，这里写清是 ToOak 生成的）
+    :param show: True = 比较完把程序留着打开给用户看（界面默认）；
+        False = 存完就关掉（测试 / 无人值守用）
+    :param engine: ``""`` = 自动（Word 优先，失败换 WPS）；``"word"`` / ``"wps"``
+        指定优先用哪一个（两边都试，指定的排前面）
+    :raises WordCompareError: 没装程序、起不来、文档打不开、超时……一律带人话
 
-    **两份原文件都只以只读方式打开**（``ReadOnly=True``），Word 不会改它们，
-    也不会因为它们已经开在用户的 Word 里而失败。
+    **两份原文件都只以只读方式打开**（``ReadOnly=True``），程序不会改它们，
+    也不会因为它们已经开在用户的窗口里而失败。
     """
     if not available():
         raise WordCompareError(unavailable_reason())
@@ -336,6 +754,13 @@ def compare(
         "TOOAK_WORD_REPORT": str(report_file),
         "TOOAK_WORD_AUTHOR": author or "",
         "TOOAK_WORD_VISIBLE": "1" if show else "0",
+        # 指定优先用哪个引擎（""=自动：按 Python 算好的顺序，Word 优先）
+        "TOOAK_WORD_ENGINE": engine or "",
+        # 引擎候选 ProgID（分号分隔）：由 _probe 按注册表算出"谁真的能用、先用谁"，
+        # 脚本不再写死 Word.Application —— 装了 WPS 的机器上那个入口可能已经易主
+        "TOOAK_WORD_ENGINES": ";".join(engine_progids()) if not engine
+        else ";".join([prog for kind, prog, _label in engines() if kind == engine]
+                      or engine_progids()),
     })
 
     started = time.monotonic()
@@ -361,6 +786,7 @@ def compare(
 
     if (match := re.search(rf"{_OK_MARK}\s+(-?\d+)\s+([01])", answer)):
         revisions = int(match.group(1)) if int(match.group(1)) >= 0 else 0
+        kind, name, path = _parse_engine(answer)
         return WordCompareResult(
             output=out_path,
             revisions=revisions,
@@ -368,6 +794,9 @@ def compare(
             revised=revised_path,
             shown=match.group(2) == "1",
             seconds=seconds,
+            engine_kind=kind,
+            engine_name=name,
+            engine_path=path,
         )
 
     reason = _explain(answer, stderr, completed.returncode)
@@ -380,6 +809,14 @@ def _read_report(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
+
+
+def _parse_engine(answer: str) -> tuple[str, str, str]:
+    """从回话里读出"这次是拿哪个程序比的"：``TOOAK-ENGINE kind|名字|exe``。"""
+    match = re.search(rf"{_ENGINE_MARK}\s*([^|\r\n]*)\|([^|\r\n]*)\|([^\r\n]*)", answer)
+    if not match:
+        return "", "", ""
+    return (match.group(1).strip(), match.group(2).strip(), match.group(3).strip())
 
 
 def _run(script_file: Path, env: dict, timeout: float):

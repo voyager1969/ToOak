@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from .diff_dialog import diff_html
+from .event_view import FILE_ROW_MIME, decode_file_row
 from .style import ACCENT, MUTED, prune_icon, scoped_style, twig_icon
 from .workers import DiffJob
 
@@ -52,6 +53,114 @@ COL_VERSION = 0
 COL_TIME = 1
 COL_CHANGE = 2
 
+#: 拖着文件从行上划过时，那一行的高亮底色（比选中色淡，不抢"当前稿"的眼）
+DROP_HIGHLIGHT = "#e6f2ea"
+
+
+class _VersionTable(QTableWidget):
+    """"年轮"那张表：**收得下"把文件拖到某一稿上"**。
+
+    以前拖到这张表上什么都不会发生 —— 想"把这一份补进 v2"只能右键菜单里点，
+    而画布上明明有一行文件可以直接拖过去。
+
+    为什么是子类而不是给实例挂方法：``dragEnterEvent`` / ``dropEvent``
+    是 C++ 侧的虚函数，PySide6 里在实例上赋值**不会**被事件分发认到
+    """
+
+    #: 把事件枝页里的一行文件拖到了某一稿上：``(目标稿, 这一行所属的稿, 文件 id)``
+    fileRowDropped = Signal(int, int, int)
+    #: 从文件管理器拖来的真文件丢到某一稿上：``(目标稿, [路径])``
+    filesDropped = Signal(int, object)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+        #: 现在高亮着的那一行（拖动经过时给个落点反馈）
+        self._drop_row: int | None = None
+
+    # ----------------------------------------------------------- 拖放
+
+    def _version_at(self, pos) -> int | None:
+        """鼠标下面那一行是哪一稿（行与列都可以落；空处返回 None）。"""
+        row = self.rowAt(int(pos.y()))
+        if row < 0:
+            return None
+        item = self.item(row, COL_VERSION)
+        if item is None:
+            return None
+        return int(item.data(Qt.ItemDataRole.UserRole))
+
+    def _drag_payload(self, mime):
+        """这次拖的是什么：``("row", 源稿, 文件 id)`` / ``("files", [路径])`` / None。"""
+        if mime.hasFormat(FILE_ROW_MIME):
+            parsed = decode_file_row(bytes(mime.data(FILE_ROW_MIME)))
+            return ("row", parsed[0], parsed[1]) if parsed else None
+        if mime.hasUrls():
+            paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            return ("files", paths) if paths else None
+        return None
+
+    def _highlight(self, row: int | None) -> None:
+        """把落点那一行点亮（**不动选中**：换选中会把画布切到那一稿）。
+
+        反馈只能用底色，不能用 ``selectRow`` / ``setCurrentCell`` ——
+        那两个都会发 ``currentCellChanged``，于是拖着文件从年轮上划过时，
+        画布会跟着一行一行地跳稿（用户看到的是"拖一下画面乱闪"）。
+        """
+        if row == self._drop_row:
+            return
+        for target, color in ((self._drop_row, None), (row, QColor(DROP_HIGHLIGHT))):
+            if target is None or target < 0 or target >= self.rowCount():
+                continue
+            for column in (COL_VERSION, COL_TIME, COL_CHANGE):
+                item = self.item(target, column)
+                if item is None:
+                    continue
+                item.setBackground(QBrush(color) if color is not None
+                                   else QBrush(Qt.BrushStyle.NoBrush))
+        self._drop_row = row
+
+    def dragEnterEvent(self, event):  # noqa: N802
+        if self._drag_payload(event.mimeData()) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # noqa: N802
+        if self._drag_payload(event.mimeData()) is None:
+            super().dragMoveEvent(event)
+            return
+        row = self.rowAt(int(event.position().y()))
+        # 行与行之间的小缝：落到**离得最近的那一行**上，别因为差两像素就不收
+        if row < 0 and self.rowCount():
+            row = min(range(self.rowCount()),
+                      key=lambda index: abs(self.rowViewportPosition(index)
+                                            + self.rowHeight(index) / 2
+                                            - event.position().y()))
+        self._highlight(row if row >= 0 else None)
+        if row < 0:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):  # noqa: N802
+        self._highlight(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):  # noqa: N802
+        payload = self._drag_payload(event.mimeData())
+        version_id = self._version_at(event.position())
+        self._highlight(None)
+        if payload is None or version_id is None:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        if payload[0] == "row":
+            self.fileRowDropped.emit(version_id, int(payload[1]), int(payload[2]))
+        else:
+            self.filesDropped.emit(version_id, list(payload[1]))
+
 
 class TimelinePanel(QWidget):
     """底部的"年轮"窗口：左边列表、右边差异、上面两个按钮。"""
@@ -64,6 +173,11 @@ class TimelinePanel(QWidget):
     deleteRequested = Signal(int)
     #: 希望看一眼某一稿的差异（内部自己也算，这里只是给主窗口一个钩子）
     diffRequested = Signal(int)
+    #: 把画布上的一行文件**拖到了某一稿上**：``(目标稿, 这一行所属的稿, 文件 id)``
+    #: 拖到年轮另一个版本上，如果重名了要提示"）
+    fileRowDropped = Signal(int, int, int)
+    #: 从文件管理器拖来的真文件丢到某一稿上：``(目标稿, [路径])``
+    filesDropped = Signal(int, object)
 
     def __init__(self, library_root: str | Path, parent: QWidget | None = None):
         super().__init__(parent)
@@ -129,7 +243,17 @@ class TimelinePanel(QWidget):
         split = QSplitter(Qt.Orientation.Horizontal, self)
         split.setChildrenCollapsible(False)
 
-        self.table = QTableWidget(0, 3, split)
+        self.table = _VersionTable(0, 3, split)
+        # 拖到某一稿上 = 把文件加进/复制进那一稿（见 _VersionTable 的说明）
+        self.table.fileRowDropped.connect(
+            lambda target, source, file_id: self.fileRowDropped.emit(target, source, file_id))
+        self.table.filesDropped.connect(
+            lambda target, paths: self.filesDropped.emit(target, paths))
+        self.table.setToolTip(
+            "点一行 = 画布切到那一稿\n"
+            "把画布上的文件行拖到某一行上 = 把那一份复制一份登记进这一稿\n"
+            "从文件管理器把文件拖到某一行上 = 把这份文件加进这一稿"
+        )
         self.table.setHorizontalHeaderLabels(["版本", "时间", "与上一稿的差别"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)

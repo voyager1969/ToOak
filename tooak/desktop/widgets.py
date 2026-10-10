@@ -21,7 +21,51 @@ from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
 from .style import SELECTION_COLOR, SELECTION_GLOW
 
 __all__ = ["ElidedLabel", "MIN_HINT_WIDTH", "paint_selection_ring",
-           "SELECTION_RING_PAD", "crisp_pixmap"]
+           "SELECTION_RING_PAD", "crisp_pixmap", "wrap_lines"]
+
+
+def wrap_lines(text: str, metrics, width: float) -> list[str]:
+    """把一段文字按宽度**折成几行**（中文按字断，英文尽量按词断）。
+
+    白板卡片以前把标题**省略号截断**（``_elide``），名字一长就只剩前半截；
+    现在改成折行、卡片按行数长高，所以需要一个"按像素宽度折行"的工具。
+
+    规则尽量贴近手写排版的直觉：
+
+    * 逐字量宽度，超了就换行；
+    * 行内**有空格**时退到最后一个空格处断（英文/拼音单词不会被劈成两半）；
+    * 单个"词"本身就比一行还宽（超长的中文串、没有空格的英文长串）→
+      硬断，否则那一行会溢出卡片。
+
+    返回的行**不含**换行符；空文字返回 ``[""]``（调用方照旧要占一行）。
+    """
+    source = str(text or "")
+    if not source:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for chunk in source.split("\n"):
+        if current:
+            lines.append(current)
+            current = ""
+        for char in chunk:
+            candidate = current + char
+            if current and metrics.horizontalAdvance(candidate) > width:
+                # 能退到空格处就退（把整个词挪到下一行；**空格留在上一行末尾** ——
+                # 这样把各行拼回去和原文一模一样，测试也好核对）
+                space = current.rfind(" ")
+                if space > 0 and metrics.horizontalAdvance(current[space + 1:]) < width:
+                    lines.append(current[:space + 1])
+                    current = current[space + 1:] + char
+                else:
+                    lines.append(current)
+                    current = char
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+            current = ""
+    return lines or [""]
 
 #: 选中环会画到图元外面多少：环本身偏 3px、柔光笔宽 6px（一半在外）= 共 6px。
 #: **每个画选中环的图元，boundingRect 都要留够这个余量** ——

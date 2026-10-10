@@ -100,6 +100,8 @@ class ProjectGraphNode:
     degree: int = 0
     #: 我依赖的那些事件枝里，有哪些已经出过比我这一稿更新的版本（"该跟一跟了"）
     stale_dependencies: list[str] = field(default_factory=list)
+    #: 上面那些里**被"忽略本次"压住的**（卡片上不再挂 ⚠，但提示里说清楚）
+    muted_dependencies: list[str] = field(default_factory=list)
     #: 我依赖的事件枝（标题；卡片上直接标注，不用顺着线去数）
     depends_on: list[str] = field(default_factory=list)
     #: 依赖我的事件枝（标题；只在悬停提示里说）
@@ -120,6 +122,14 @@ class ProjectGraphNode:
             return ""
         names = "、".join(self.stale_dependencies)
         return f"依赖的事件枝已更新：{names}（本事件枝还没出新的稿）"
+
+    @property
+    def muted_text(self) -> str:
+        """被"忽略本次"压住的那些告警（提示里说清楚，别让人以为上游没动过）。"""
+        if not self.muted_dependencies:
+            return ""
+        names = "、".join(self.muted_dependencies)
+        return f"已忽略的依赖告警：{names}（上游再出新稿时会重新提醒）"
 
     @property
     def dependency_text(self) -> str:
@@ -194,6 +204,7 @@ class ProjectGraphNode:
             "y": self.y,
             "degree": self.degree,
             "stale_dependencies": self.stale_dependencies,
+            "muted_dependencies": self.muted_dependencies,
             "needs_attention": self.needs_attention,
             "depends_on": self.depends_on,
             "depended_by": self.depended_by,
@@ -247,6 +258,8 @@ class BoardCard:
     url: str = ""
     origin: str = "user"
     color: str = ""
+    #: **吸附在哪个事件枝上**（0 = 自由摆放）。贴着的说明框跟着那张卡片一起挪 ——
+    attached_document_id: int = 0
 
     @property
     def is_material(self) -> bool:
@@ -284,6 +297,7 @@ class BoardCard:
             "origin": self.origin,
             "color": self.color,
             "is_material": self.is_material,
+            "attached_document_id": self.attached_document_id,
         }
 
 
@@ -307,6 +321,9 @@ class BoardGroup:
     h: float = 0.0
     #: True = 大小由用户定（不跟着成员收紧）；False = 框跟着成员收紧
     manual: bool = False
+    #: True = 这一组**折起来了**：白板上只剩标题栏那一条，成员卡片收在里面
+    #: （位置一个都不改，展开回来还是原样）
+    collapsed: bool = False
     document_ids: list[int] = field(default_factory=list)
 
     @property
@@ -328,6 +345,7 @@ class BoardGroup:
             "w": self.w,
             "h": self.h,
             "manual": self.manual,
+            "collapsed": self.collapsed,
             "document_ids": self.document_ids,
         }
 
@@ -498,10 +516,17 @@ def build_project_graph(
             depends.setdefault(edge.source_document_id, []).append(target_title)
             dependents.setdefault(edge.target_document_id, []).append(source_title)
     alerts = library.dependency_alerts(project_id)
+    # 被"忽略本次"压住的那些：卡片上不挂 ⚠ 了，但提示里要说一句
+    # （用户右键点过"忽略本次依赖告警"，回头看时得知道上游确实动过）
+    muted: dict[int, list[str]] = {}
+    for row in library.dependency_alert_details(project_id):
+        if row["acked"]:
+            muted.setdefault(int(row["source_id"]), []).append(str(row["dep_title"]))
     for node in nodes:
         node.depends_on = sorted(set(depends.get(node.document_id, [])))
         node.depended_by = sorted(set(dependents.get(node.document_id, [])))
         node.stale_dependencies = list(alerts.get(node.document_id, []))
+        node.muted_dependencies = sorted(set(muted.get(node.document_id, [])))
 
     degree: dict[int, int] = {}
     for edge in graph.edges:
@@ -520,7 +545,8 @@ def build_project_graph(
                   height=float(row["h"]), title=str(row["title"] or ""),
                   text=str(row["text"] or ""), path=str(row["path"] or ""),
                   url=str(row["url"] or ""), origin=str(row["origin"] or "user"),
-                  color=str(row["color"] or ""))
+                  color=str(row["color"] or ""),
+                  attached_document_id=int(row.get("attached_document_id") or 0))
         for row in library.board_cards(project_id)
     ]
 
@@ -532,6 +558,7 @@ def build_project_graph(
                        x=float(row["x"] or 0.0), y=float(row["y"] or 0.0),
                        w=float(row["w"] or 0.0), h=float(row["h"] or 0.0),
                        manual=bool(row["manual"]),
+                       collapsed=bool(row.get("collapsed")),
                        document_ids=members)
         )
 

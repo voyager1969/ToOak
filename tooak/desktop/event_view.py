@@ -44,8 +44,10 @@
 
 from __future__ import annotations
 
+import html
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,10 +95,10 @@ from ..core.diffing import summarize_change
 from ..core.util import human_size, to_local_str
 from . import zoom
 from .style import (ACCENT, ACCENT_LINE, ACCENT_SOFT, BORDER, BOX_GLYPH_KINDS,
-                    MUTED, TEXT, box_glyph, branch_pixmap, compare_icon,
-                    document_icon, export_icon, folder_icon, import_icon,
-                    info_icon, leaf_icon, logo_pixmap, open_icon, pencil_icon,
-                    prune_icon, scoped_style, state_colors, twig_icon)
+                    MATCH_FILL, MATCH_INK, MUTED, TEXT, box_glyph, branch_pixmap,
+                    compare_icon, document_icon, export_icon, folder_icon,
+                    import_icon, info_icon, leaf_icon, logo_pixmap, open_icon,
+                    pencil_icon, prune_icon, scoped_style, state_colors, twig_icon)
 from .widgets import (SELECTION_RING_PAD, crisp_pixmap,
                       paint_selection_ring)
 
@@ -255,6 +257,30 @@ def card_name_lines(text: str, metrics: QFontMetrics, card_width: float,
     return lines, False
 
 
+def _same_deliverable(left: str, right: str) -> bool:
+    """两个文件名是不是"同一份交付物的不同叫法"。
+
+    判据两条（任一成立就算）：
+    * 同名（大小写不敏感）—— 绝大多数情况；
+    * 去掉日期 / 版本号 / "提交·终版·定稿"这类噪音之后仍然很像
+      （``util.name_similarity`` ≥ ``library.NAME_MATCH_FLOOR``）——
+      用户的习惯就是每稿改名字，用这一条才不会把"改了名的同一份东西"
+      又当成"缺了一份"补一行灰的出来。
+
+    这是**界面用**的粗判：真配对（要拿去比 Word 的那一对）仍然走内核
+    ``Library.counterpart_file`` 那套更严的规则。
+    """
+    first, second = str(left or ""), str(right or "")
+    if not first or not second:
+        return False
+    if first.strip().casefold() == second.strip().casefold():
+        return True
+    from ..core.util import name_similarity
+
+    from ..core.library import NAME_MATCH_FLOOR
+    return name_similarity(first, second) >= NAME_MATCH_FLOOR
+
+
 @dataclass
 class FileEntry:
     """文件列表里一行要显示的全部信息。"""
@@ -265,6 +291,9 @@ class FileEntry:
     size: int
     sha256: str
     mime: str = ""
+    #: 这一行**所属的那一稿**是第几稿。``stale`` 的行属于更早的那一稿，
+    #: 改它名字就是在改那一稿记的名字，所以菜单上必须把稿号写出来
+    version_seq: int = 0
     #: 入库时间（这一稿是什么时候归档进库的）
     created_at: str = ""
     source_path: str = ""
@@ -395,7 +424,7 @@ class FileRow(QWidget):
         #: 右键菜单必须用它来算 role：以前 show_file_menu 里写的是
         #: ``box = box or self._boxes.get("extra")``，而调用方没传 box，
         #: 于是「输入文件」里的卡片右键显示"添加文件到「其他文件」"，
-        #: 点"加入到这一稿"也把文件归到「其他文件」去了。
+        #: 点"添加文件到「输入文件」…"也把文件归到「其他文件」去了。
         self.box = box
         # 兼容原来的字段名（旧代码/测试还在用）
         self.name = entry.name
@@ -431,6 +460,7 @@ class FileRow(QWidget):
         text.setSpacing(0)
         self.name_label = QLabel(self.name, self)
         self.name_label.setProperty("role", "filename")
+        self.name_label.setTextFormat(Qt.TextFormat.PlainText)
         scoped_style(
             self.name_label,
             f"font-size:{CARD_FONT_PT + 0.4:.1f}pt;"
@@ -438,6 +468,7 @@ class FileRow(QWidget):
             name="fileName",
         )
         text.addWidget(self.name_label)
+        self.apply_search("")
 
         meta_bits: list[str] = []
         if self.missing == "missing":
@@ -521,6 +552,41 @@ class FileRow(QWidget):
         # 兜底：自己画的通用文件图标（折角纸），保持和其它线描图标一个风格
         self.thumb.setPixmap(document_icon(int(THUMB) - 4).pixmap(int(THUMB) - 4,
                                                               int(THUMB) - 4))
+
+    def apply_search(self, term: str) -> None:
+        """把搜索命中的那几个字在**文件名**上标出来。
+
+
+        这一处是 QLabel，所以用富文本标（`<span>` 加底色），而不是自己去 paint：
+        这一行的字号 / 颜色都挂在样式表上，重画一遍等于把那套设置抄一份，
+        抄完就等着以后对不上。每一段都先 `html.escape` —— `&` / `<` 这类字符
+        不会把标签撑坏。
+
+        ``highlight.match_spans`` 统一算（与左边那棵树、与内核的拆词规则同一套），
+        这里只负责把区间拼成 HTML。
+        """
+        from .highlight import match_spans
+
+        needle = str(term or "").strip()
+        spans = match_spans(self.name, needle) if needle else []
+        if not spans:
+            self.name_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.name_label.setText(self.name)
+            return
+        parts: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            if start > cursor:
+                parts.append(html.escape(self.name[cursor:start]))
+            parts.append(
+                f'<span style="background-color:{MATCH_FILL};color:{MATCH_INK};">'
+                f"{html.escape(self.name[start:end])}</span>"
+            )
+            cursor = end
+        if cursor < len(self.name):
+            parts.append(html.escape(self.name[cursor:]))
+        self.name_label.setTextFormat(Qt.TextFormat.RichText)
+        self.name_label.setText("".join(parts))
 
     def _build_tooltip(self) -> str:
         notes = {
@@ -1333,8 +1399,6 @@ class EventStageView(QGraphicsView):
     #: 把**这一稿里的某一行文件**拖到了另一个环节方框上
     #: ``(事件 id, 版本 id, 文件 id, 目标环节)`` —— 只是"换个环节"，不新建稿
     fileRoleChangeRequested = Signal(int, int, int, str)
-    #: 请求给某个文件加新版本（事件 id, 环节, 版本 id）
-    newVersionRequested = Signal(int, str, int)
     #: 打开某一份文件（版本 id, 文件 id）
     fileOpenRequested = Signal(int, int)
     #: 导出某一份文件
@@ -1357,6 +1421,9 @@ class EventStageView(QGraphicsView):
     #: 把"未登记"的那一份文件**另外登记到某一稿**（它所属的稿, 文件 id, 目标稿）
     #: —— 界面上的「复制一份到这一稿 / 到最新稿」，目标稿由**用户看到的那行字**决定
     fileRegisterRequested = Signal(int, int, int)
+    #: 给库里的一行文件**改名**（它所属的稿, 文件 id）—— 界面上的右键「改名…」。
+    #: 不碰用户磁盘上的原文件；库内那份自己的副本会跟着改名
+    fileRenameRequested = Signal(int, int)
     #: 兼容旧名（双击卡片等价于打开文件）
     openRequested = Signal(int, int)
     #: 请求为失效引用重新绑定（版本 id）
@@ -1393,6 +1460,8 @@ class EventStageView(QGraphicsView):
 
         self.document_id: int = 0
         self.version_id: int = 0
+        #: 眼下这一页看的是第几稿（文件行右键的「改名」要用它说清改的是哪一稿）
+        self.version_seq: int = 0
         #: 新方框的默认格数（没排过版的方框用它；存在库里 ui:event.units）
         self.default_units = (DEFAULT_UNITS_W, DEFAULT_UNITS_H)
 
@@ -1428,6 +1497,8 @@ class EventStageView(QGraphicsView):
         self._empty_press_pos: QPoint | None = None
         #: 有没有文件行正在拖放中（拖动循环还没返回，见上面那三个方法）
         self._file_row_drag = False
+        #: 搜索框里现在搜的是什么（文件行上命中的字要标出来）
+        self.search_term = ""
         #: 日期控件用的日历弹窗（顶层窗口，由信息框按需弹出）
         self.calendar_popup: CalendarPopup | None = None
         #: 日历里选中日期后要写回哪个日期框
@@ -1708,6 +1779,17 @@ class EventStageView(QGraphicsView):
         if zoom.space_pan_key(self, event):
             event.accept()
             return
+        # 绑到 delete 键盘动作"）。真正删之前主窗口会弹一次确认框并写明版本号，
+        # 所以这里放心地把选择交出去 —— 顺手把选择也清掉，免得"删完了那一行还亮着"。
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            rows = [row.entry for row in self._selected_rows]
+            if rows:
+                self.filesDeleteRequested.emit(
+                    self.document_id, [(entry.version_id, entry.file_id) for entry in rows]
+                )
+                self.clear_selection()
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):  # noqa: N802
@@ -1905,6 +1987,7 @@ class EventStageView(QGraphicsView):
         if version is None:
             version = library.latest_version(document_id)
         self.version_id = version.id if version else 0
+        self.version_seq = version.seq if version else 0
         self._fill_timeline(library, document)
 
         # 先清 Python 侧的引用，再清场景：否则会摸到已经被 C++ 删掉的对象
@@ -1934,12 +2017,7 @@ class EventStageView(QGraphicsView):
             box = box_class(role, ROLE_LABELS.get(role, role), document.state, self)
             self._scene.addItem(box)
             box.set_files(entries)
-            if not entries:
-                box.hint = "把一张图拖进来" if role == "figure" else "空"
-            elif all(entry.stale for entry in entries):
-                box.hint = f"{len(entries)} 个 · {entries[0].stale_note or '未登记'}"
-            else:
-                box.hint = f"{len(entries)} 个文件"
+            box.hint = self._box_hint(entries, figure=role == "figure")
             box.setToolTip(
                 f"{box.label}\n"
                 "把文件拖进来 = 加进**当前这一稿**的这个环节（不会新建稿）\n"
@@ -1953,7 +2031,7 @@ class EventStageView(QGraphicsView):
         box = StageBoxItem(EXTRA_ROLE, "其他文件", document.state, self)
         self._scene.addItem(box)
         box.set_files(entries)
-        box.hint = f"{len(entries)} 个" if entries else "空"
+        box.hint = self._box_hint(entries)
         box.setToolTip(
             "其他文件\n"
             "说明类文本、主文件、附件这类不好归进环节的都放这里\n"
@@ -1964,6 +2042,9 @@ class EventStageView(QGraphicsView):
 
         self._build_info_boxes(document)
         self.fill_version_note(version)
+        # 页面是**重建**出来的：上面那些新行还没吃到我现在的搜索关键词，
+        # 这里统一补一遍（否则"搜着搜着切一稿，高亮就没了"）
+        self._apply_search_to_rows()
 
         # 排版不是"每个事件枝各排一份"，而是全库共用的**框体模板**
         self.apply_layout(self._all_boxes(), library.box_template())
@@ -1978,6 +2059,23 @@ class EventStageView(QGraphicsView):
     def attach_timeline_panel(self, panel) -> None:
         """主窗口把底部"年轮"窗口交给画布（内容由画布负责填）。"""
         self.timeline_panel = panel
+
+    def set_search(self, text: str) -> None:
+        """告诉事件枝页"现在在搜什么"：文件名里命中的那几个字标出来。
+
+        只是个画法（不筛掉任何一行）：关键词为空、或者这一行没命中时，
+        文字与以前一模一样（``FileRow.apply_search``）。
+        """
+        term = str(text or "").strip()
+        if term == self.search_term:
+            return
+        self.search_term = term
+        self._apply_search_to_rows()
+
+    def _apply_search_to_rows(self) -> None:
+        for box in self._boxes.values():
+            for row in getattr(box, "files", ()):
+                row.apply_search(self.search_term)
 
     def _fill_timeline(self, library: Library, document) -> None:
         """填底部"年轮"窗口：每一稿一行（最新在最上），点一下就切那一稿。
@@ -2052,6 +2150,7 @@ class EventStageView(QGraphicsView):
             return FileEntry(
                 file_id=item.id,
                 version_id=item.version_id if stale else version.id,
+                version_seq=(older.seq if stale else version.seq),
                 name=item.name,
                 size=item.size,
                 sha256=item.sha256,
@@ -2068,20 +2167,54 @@ class EventStageView(QGraphicsView):
         for item in version.files:
             grouped.setdefault(item.role, []).append(make_entry(item, False))
 
-        # 旧库是"增量登记"的：一稿里只写那一次登记过的文件。
-        # 所以当前稿为空的环节，用它最后一次登记过的那一稿来显示，并标上"未登记"。
+        # 旧库是"增量登记"的：一稿里只写那一次登记过的文件，所以这一稿某个环节里
+        # **可能少了几份上一稿还在的文件**。它们要留成灰色的「未登记」行，
+        # 也留灰色显示的文件，而不是现在这样最新版本里只要有东西，就不会显示其他文件缺少的情况"）。
+        #
+        # 两条规矩：
+        # * 只在**这一稿没有任何一行提到它**时才补（同一份交付物改了名字也算"提到"，
+        #   用内核那套模糊名字匹配判断，见 ``_same_deliverable``）；
+        # * 每个环节只看**最近一稿登记过这个环节的**那些文件（跟以前一样），
+        #   往更早的稿里无限追溯只会把画布塞满历史。
         history = library.version_history(document.id)
         for role in set(FLOW_ROLES) | set(grouped):
-            if grouped.get(role):
-                continue
+            current = grouped.get(role, [])
             for older in reversed(history):
                 if older.id == version.id:
                     continue
                 members = [item for item in older.files if item.role == role]
-                if members:
-                    grouped[role] = [make_entry(item, True) for item in members]
-                    break
+                if not members:
+                    continue
+                missing = [item for item in members
+                           if not any(_same_deliverable(item.name, entry.name)
+                                      for entry in current)]
+                if missing:
+                    # 老行的 version_id 要指向**它自己所属的那一稿**（见 make_entry 的说明）
+                    for item in missing:
+                        grouped.setdefault(role, []).append(make_entry(item, True))
+                else:
+                    # 这一稿里已经全都有对应（包括改了名字的）：不用再补灰行
+                    pass
+                break
         return grouped
+
+    @staticmethod
+    def _box_hint(entries: list[FileEntry], *, figure: bool = False) -> str:
+        """方框抬头那句小字：**数出来的文件里，有几份这一稿没登记**。
+
+        以前只在"整框全是灰行"时才写「N 个 · 最新稿未登记」，一旦这一稿自己也登记了
+        东西（哪怕只登记了一份），提示就变成干巴巴的「2 个文件」——
+        文件的情况，也留灰色显示的文件"）。所以混着的时候把灰的那几份数出来。
+        """
+        if not entries:
+            return "把一张图拖进来" if figure else "空"
+        stale = [entry for entry in entries if entry.stale]
+        if not stale:
+            return f"{len(entries)} 个文件"
+        note = stale[0].stale_note or "未登记"
+        if len(stale) == len(entries):
+            return f"{len(entries)} 个 · {note}"
+        return f"{len(entries)} 个文件 · 其中 {len(stale)} 份{note}"
 
     def _build_info_boxes(self, document) -> None:
         # 日历弹窗是视图的顶层窗口：每次重建画布换一个新的（旧的先关掉）
@@ -2682,6 +2815,7 @@ class EventStageView(QGraphicsView):
             export_icon(16), "导出到…",
             lambda: self.fileExportRequested.emit(entry.version_id, entry.file_id)
         )
+        self._add_rename_action(menu, entry)
         menu.addSeparator()
         if entry.source_path:
             menu.addAction(
@@ -2689,10 +2823,11 @@ class EventStageView(QGraphicsView):
                 lambda: self.fileOriginFolderRequested.emit(entry.version_id, entry.file_id),
             )
         menu.addSeparator()
-        menu.addAction(
-            twig_icon(16), "加入到这一稿…",
-            lambda: self.newVersionRequested.emit(self.document_id, role, entry.version_id),
-        )
+        # 建议只保留后一个，取代的功能是右键文件菜单里，提供加入到某个版本-选择版本"）：
+        # 两件事都发生在**同一个环节**（`role` 取的都是方框的 role），菜单上并排放着
+        # 用户根本分不清该点哪个。留下"添加文件到「方框」…"这条更直白的；
+        # 而"把这一份补进别的某一稿"改用下面那个**选稿号**的子菜单，语义清楚得多。
+        self._add_into_version_menu(menu, entry, box)
         menu.addAction(
             import_icon(16), f"添加文件到「{box.label}」…",
             lambda: self.addFilesRequested.emit(self.document_id, role),
@@ -2719,6 +2854,59 @@ class EventStageView(QGraphicsView):
             )
         menu.exec(global_pos)
 
+    def _add_into_version_menu(self, menu: QMenu, entry: FileEntry,
+                               box: StageBoxItem | None) -> None:
+        """「加入到某一稿（复制一份）→」子菜单：把这一份文件**复制一份进指定的那一稿**。
+
+        原来那条「加入到这一稿…」和「添加文件到「方框」…」做的是同一件事
+        （都落在同一个环节），并排摆着只会让人犹豫；现在改成：
+        补进**别的一稿**是这条子菜单的事（点哪一稿就落哪一稿，稿号写在字里），
+        往**这一稿**加文件是「添加文件到「方框」…」的事。
+
+        稿号由 ``versionTargets`` 提供（主窗口给的 ``[{id, seq, label}]``）。
+
+        **哪一项该灰**：是**这一行自己登记的那一稿**（``entry.version_id``），
+        我现在在 v2，不应该有右键里能把文件加入 v1 这稿的选项" —— 那一行本来就
+        是 v1 的，往 v1 "再复制一份"只会被内核拒掉（"本来就登记在 v1 里"）。
+        反过来，"正在看的这一稿"恰恰是**最该点**的那一项：未登记的行显示在
+        v2 上、它属于 v1，点 v2 就是"这一稿也认下这份文件"（最初的
+        「复制一份到这一稿」做的正是这件事），绝不能灰掉。
+        """
+        versions = []
+        if isinstance(box, StageBoxItem):
+            versions = list(self.version_targets().get("drafts") or [])
+        if not versions:
+            return
+        submenu = menu.addMenu(twig_icon(16), "加入到某一稿（复制一份）→")
+        submenu.setToolTip(
+            "把这一份**复制一份**登记进指定的那一稿（内容相同、各存各的实体文件）。\n"
+            "点哪一稿就落在哪一稿；它本来登记着的那一稿是灰的（再放一份没有意义）"
+        )
+        for draft in versions:
+            version_id = int(draft.get("id") or 0)
+            if not version_id:
+                continue
+            label = str(draft.get("label") or f"v{draft.get('seq')}")
+            own = version_id == int(entry.version_id or 0)
+            if own:
+                suffix = "（它本来就登记在这里）"
+            elif draft.get("is_current"):
+                suffix = "（就是现在看的）"
+            else:
+                suffix = ""
+            action = submenu.addAction(
+                leaf_icon(16), f"v{draft.get('seq')} 这一稿{suffix}",
+                lambda _checked=False, target=version_id:
+                self.fileRegisterRequested.emit(entry.version_id, entry.file_id, target),
+            )
+            action.setToolTip(
+                f"把「{entry.name}」复制一份到 v{draft.get('seq')}"
+                + (f"（{label}）" if label else "")
+                + ("；它本来就登记在这一稿里，再放一份没有意义" if own else "")
+            )
+            if own:
+                action.setEnabled(False)
+
     def _add_register_menu(self, menu: QMenu, entry: FileEntry,
                            box: StageBoxItem | None) -> None:
         """「未登记」那一行的右键项：**把它复制一份登记到某一稿**。
@@ -2744,56 +2932,115 @@ class EventStageView(QGraphicsView):
         if isinstance(box, StageBoxItem):
             role_label = ROLE_LABELS.get(self._role_of(box), "")
         shown_is_latest = not latest_id or latest_id == shown_id
+        own_id = int(entry.version_id or 0)
 
         # ① 加进**正在看的这一稿**（页面抬头写的那一稿）
-        menu.addAction(
+        # 未登记的行属于**更早**某一稿，所以"正在看的这一稿"正常都不是它自己；
+        # 但用户可能正翻着更早的稿看（那一行反而是更新的稿登记过的），
+        # 这时它就是它自己那一稿 —— 内核会拒（"本来就登记在 v{seq} 里"），
+        # 所以这里如实置灰，而不是让用户点一下吃个错误。
+        add_here = menu.addAction(
             leaf_icon(16),
             (f"复制一份到最新稿（v{shown_seq}）…" if shown_is_latest
              else f"复制一份到这一稿（v{shown_seq}）…"),
             lambda: self.fileRegisterRequested.emit(
                 entry.version_id, entry.file_id, shown_id
             ),
-        ).setToolTip(
-            f"把这一行（它登记在更早的那一稿里）另外登记到 v{shown_seq} 的"
-            f"「{role_label}」里。\n"
-            "内容是**真的复制一份进库**（库里 files/ 下有自己的那份文件）；\n"
-            "不新建稿，你磁盘上的原文件一个字节都不动"
         )
+        if own_id == int(shown_id):
+            add_here.setEnabled(False)
+            add_here.setToolTip(
+                f"这一行本来就登记在 v{shown_seq} 里，不用再放一份"
+            )
+        else:
+            add_here.setToolTip(
+                f"把这一行（它登记在更早的那一稿里）另外登记到 v{shown_seq} 的"
+                f"「{role_label}」里。\n"
+                "内容是**真的复制一份进库**（库里 files/ 下有自己的那份文件）；\n"
+                "不新建稿，你磁盘上的原文件一个字节都不动"
+            )
         # ② 加进**真正的最新稿**（只有它不是正在看的那一稿时才多这一项）
         if not shown_is_latest and latest_id:
-            menu.addAction(
+            add_latest = menu.addAction(
                 leaf_icon(16), f"复制一份到最新稿（v{latest.get('seq')}）…",
                 lambda: self.fileRegisterRequested.emit(
                     entry.version_id, entry.file_id, latest_id
                 ),
-            ).setToolTip(
-                f"登记到**最新的一稿 v{latest.get('seq')}**"
-                f"（你现在看的是 v{shown_seq}，它才是最新稿）"
             )
+            if own_id == int(latest_id):
+                # 翻着更早的稿看时，这一行可能正是最新稿登记的那一份：
+                # "复制到最新稿"等于"复制到它自己那一稿"，没有意义
+                add_latest.setEnabled(False)
+                add_latest.setToolTip(
+                    f"这一行本来就登记在 v{latest.get('seq')} 里（最新稿），"
+                    "不用再放一份"
+                )
+            else:
+                add_latest.setToolTip(
+                    f"登记到**最新的一稿 v{latest.get('seq')}**"
+                    f"（你现在看的是 v{shown_seq}，它才是最新稿）"
+                )
+
+    def _add_rename_action(self, menu: QMenu, entry: FileEntry) -> None:
+        """
+
+        为什么要有这一项：用户习惯每稿把文件名改得更贴合当期（"结构计算书-终版"），
+        而库里的名字是归档那一刻定下的；以前只能"删掉这一行再拖一次文件"，
+        那会把文件重新复制一份进库、还会丢掉这一笔的登记时间。
+
+        两条必须写清（都在这段里）：
+
+        * 改的是**库里怎么称呼它**，不是用户磁盘上那个文件 —— 引用模式下
+          用户自己的文件原名一个字都不动；库内副本（复制进库的那份）会跟着改名，
+          因为它就是库自己的文件；
+        * ``stale`` 的行（"未登记"那种）属于**更早的那一稿**，改它名字改的是
+          那一稿记的名字，所以菜单上直接把稿号写出来，别让人以为在改眼前这一稿。
+        """
+        if entry.version_seq and entry.version_seq != self.version_seq:
+            label = f"改名（改 v{entry.version_seq} 里记的名字）…"
+            tip = (f"这一行登记在 v{entry.version_seq} 里（眼下看的这一稿没有登记它），"
+                   f"所以改的是 v{entry.version_seq} 记的名字。\n"
+                   "只改库里记的名字，你磁盘上的原文件不动")
+        else:
+            label = "改名…"
+            tip = ("给这一份文件在库里换个名字（这一稿的文件清单、导出、Word 比较里\n"
+                   "都会跟着变）。引用模式下**你磁盘上的原文件不动**；\n"
+                   "复制进库的那一份会把库内的实体文件一起改名")
+        menu.addAction(
+            pencil_icon(16), label,
+            lambda: self.fileRenameRequested.emit(entry.version_id, entry.file_id),
+        ).setToolTip(tip)
 
     def _add_word_compare_menu(self, menu: QMenu, entry: FileEntry) -> None:
-        """「用 Word 比较」子菜单：调**本机 Word 自己的**比较功能（审阅 → 比较 → 比较文档）。
+        """「用 Word 比较」子菜单：调**本机程序自己的**比较功能（审阅 → 比较 → 比较文档）。
 
+        后来又补了一句"自动添加 wps 比较功能的支持"。
 
-        三条纪律：
+        四条纪律：
 
         * **不是 Word 文件就整块不出现**（不是灰着占地方）：一份 PDF / 图纸
-          拿去调 Word 毫无意义，菜单里多一行只会让人点一下试试；
-        * **没装 Word 时出现但置灰**，提示里写明为什么 —— 用户至少知道
-          "这个软件本来有这个功能，是我这台机器没有 Word"，而不是以为功能不存在；
+          拿去调文字处理软件毫无意义，菜单里多一行只会让人点一下试试；
+        * **没装 Word 也没装 WPS 时出现但置灰**，提示里写明为什么 —— 用户至少知道
+          "这个软件本来有这个功能，是我这台机器没装"，而不是以为功能不存在；
+        * **标题按本机装了什么写**（"用 Word 比较" / "用 WPS 文字比较"）：
+          装了两套时写"用 Word 或 WPS 比较"，点下去谁干活由内核按优先级挑
+          （见 ``core/wordcompare.ENGINES``）；
         * **只列更早的稿**，每条都写清是哪一稿的哪一份文件（跨环节配上的还要写出角色）。
           比的是"这一稿相对上一稿改了什么"，反向比较交给底侧的「各稿」窗口。
         """
         info = self.word_compare_info(entry.version_id, entry.file_id)
         if not info or not info.get("is_word"):
             return
-        submenu = menu.addMenu(compare_icon(16), "用 Word 比较")
+        engine_label = str(info.get("word_engine") or "Word")
+        hint = str(info.get("word_hint") or "")
+        submenu = menu.addMenu(compare_icon(16), f"用 {engine_label} 比较")
         submenu.setToolTip(
-            "调用本机 Word 的「审阅 → 比较」，生成一份带修订标记的文档；\n"
-            "库里的文件一个字节都不会动"
+            f"调用{('本机 ' + engine_label) if not hint else hint} 的「审阅 → 比较」，"
+            "生成一份带修订标记的文档；\n"
+            "库里的文件与你的原文件一个字节都不会动"
         )
         if not info.get("word_available"):
-            unavailable = submenu.addAction("本机没有可用的 Microsoft Word")
+            unavailable = submenu.addAction("本机没有可用的 Word / WPS")
             unavailable.setEnabled(False)
             unavailable.setToolTip(info.get("reason") or info.get("word_reason") or "")
             return
@@ -2813,7 +3060,7 @@ class EventStageView(QGraphicsView):
             )
             action.setToolTip(
                 f"以 {info.get('name', '')} 为修订版、{candidate['label']} 为原文，"
-                "让 Word 生成一份带修订标记的文档"
+                f"让 {engine_label} 生成一份带修订标记的文档"
             )
         if not candidates:
             empty = submenu.addAction("没有更早的稿可以比")

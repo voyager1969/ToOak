@@ -14,11 +14,12 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 20
 
 class DatabaseError(Exception):
     """库结构层的问题（结构版本比程序新、迁移中途被打断等）。"""
@@ -510,6 +511,74 @@ MIGRATIONS: dict[int, list[str]] = {
         "CREATE INDEX IF NOT EXISTS idx_blobs_sha256 ON blobs(sha256)",
         "CREATE INDEX IF NOT EXISTS idx_blobs_source ON blobs(source)",
     ],
+    # v16：白板上的说明框（便签）可以**吸附在某个事件枝上**，跟着它一起动。
+    #
+    # 说明框本来只是白板上一块自由的文字（位置是绝对坐标），
+    # 把事件枝拖到别处之后，写它的那段话就留在原地、跟内容脱节了。
+    # 现在多一列记"它贴着哪个事件枝"：贴着的便签在卡片挪动时一起挪，
+    # 卡片被删掉时这一列自动置空（便签本身留着 —— 那段话是用户写的，不许删）。
+    16: [
+        "ALTER TABLE board_cards ADD COLUMN attached_document_id INTEGER "
+        "REFERENCES documents(id) ON DELETE SET NULL",
+        "CREATE INDEX IF NOT EXISTS idx_board_cards_attached "
+        "ON board_cards(attached_document_id)",
+    ],
+    # v17：项目树可以**手工排序**（侧栏工具栏上的上移 / 下移按钮）。
+    #
+    # 原来列表是按 id（也就是建库顺序）排的，用户没法把常用的那棵树挪到最上面。
+    # 老库一律填 0 —— 排序是 "position, id"，全 0 时自然还是按 id，与升级前一致。
+    # 换个位置时把整列重写成 0..n-1（见 ``Library.move_project``）。
+    17: [
+        "ALTER TABLE projects ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS idx_projects_position ON projects(position)",
+    ],
+    # v18：白板上的分组框可以**折叠**。
+    #
+    # 想先看别的组就得把这一组整个挪开。折叠后只剩标题栏那一条，成员卡片
+    # （和贴着它们的便签、连着它们的线）一起藏起来，位置**一个都不改**：
+    # 展开回来还是原来的样子。
+    # 记住"折没折"（而不是只记在内存里）：这是用户对这个版图的安排，
+    # 关掉程序再打开不该又全都摊开。
+    18: [
+        "ALTER TABLE board_groups ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0",
+    ],
+    # v19：一个事件枝**只能属于一个分组**。
+    #
+    # 待在三个组里，白板上几张框叠在同一片区域，左边那棵树也没法把它挂在某一个组
+    #
+    # 两步走：
+    #   1. 先把历史数据去重：同一个人挂在多个组时，只留**最早把他加进去的那一组**
+    #   2. 再加唯一索引，把这条规矩钉在库里：以后任何一条 INSERT 想往第二个组里
+    #      塞同一个人，SQLite 直接拦下来（界面那边是"移动"语义：先退出旧组）。
+    19: [
+        "DELETE FROM board_group_members WHERE rowid NOT IN ("
+        "  SELECT MIN(m.rowid) FROM board_group_members m"
+        "  GROUP BY m.document_id"
+        ")",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_group_member_one_group "
+        "ON board_group_members(document_id)",
+    ],
+    # v20：**忽略本次依赖告警**。
+    #
+    # （见 ``Library.dependency_alerts``）—— 有时用户已经知道这件事（就是特意先不动），
+    # 于是卡片上那个琥珀色 ⚠ 一直挂着，成了噪音。
+    #
+    # 上游以后再出新稿（时间更大）时告警**照旧会回来** —— 这也是"本次"两个字的含义。
+    # 用一张小表而不是文档上的一列：一条告警是一对事件（我 → 依赖谁），
+    # 一列存不下"忽略了哪几条"，也没法单独恢复。
+    20: [
+        """
+        CREATE TABLE IF NOT EXISTS dependency_acks (
+            from_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            to_document_id   INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            acked_at         TEXT NOT NULL,
+            acked_dep_time   TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (from_document_id, to_document_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_dependency_acks_from "
+        "ON dependency_acks(from_document_id)",
+    ],
 }
 
 #: 需要**先关掉外键约束**才能跑的迁移（只能关在事务外面，见 SQLite 的
@@ -518,11 +587,74 @@ MIGRATIONS: dict[int, list[str]] = {
 FK_OFF_MIGRATIONS = {15}
 
 
+def read_schema_version(path: str | Path) -> int | None:
+    """**只读**地问一句：这个库文件现在是什么结构版本？
+
+    为什么要有它：迁移是**不可逆**的（升完新版，旧版 ToOak 就打不开这个库了），
+    所以界面要在**打开库之前**先看一眼"要不要升级、要不要先备份"。
+    而 ``Database.__init__`` 一打开就顺手迁移 —— 那时候再问已经晚了。
+    这里用 ``mode=ro`` 的只读连接，**不建库、不迁移、不改一个字节**。
+
+    :returns: 版本号；文件不在 / 不是 ToOak 库 / 读不出来时返回 ``None``。
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        return None
+    try:
+        # 用 ``as_uri()`` 而不是手拼 ``file:{path}``：库目录常常带中文
+        # （``D:\资料\我的库``），URI 里的非 ASCII 必须百分号编码 ——
+        # 手拼的那版在中文路径上会连不上（实测报"unable to open database file"）。
+        conn = sqlite3.connect(file_path.resolve().as_uri() + "?mode=ro", uri=True,
+                               timeout=5.0)
+    except (sqlite3.Error, ValueError):
+        return None
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'"
+                           ).fetchone()
+    except sqlite3.Error:
+        # 没有 meta 表 = 不是 ToOak 建的库（或者是个别的 SQLite 文件）
+        return None
+    finally:
+        conn.close()
+    if row is None or row[0] in (None, ""):
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _note_upgrade(path: Path, old: int, new: int) -> None:
+    """库在升级结构时往 stderr 留一句（CLI / 服务端看得见，界面另有弹窗）。
+
+    只打一次：一个进程里可能反复开关同一个库（每个后台任务各开一次），
+    每次都喊一遍就成噪音了。
+    """
+    global _UPGRADE_NOTED
+    key = (str(path), old, new)
+    if key in _UPGRADE_NOTED:
+        return
+    _UPGRADE_NOTED.add(key)
+    print(
+        f"注意：库 {path} 的结构正在从 v{old} 升级到 v{new}"
+        f"（只加列 / 建表，数据不动；升级后旧版 ToOak 打不开这个库）。\n"
+        f"      升级前建议先备份库目录：把整个目录拷一份到旁边即可。",
+        file=sys.stderr,
+    )
+
+
+#: 已经喊过"正在升级"的库（见 :func:`_note_upgrade`）
+_UPGRADE_NOTED: set[tuple[str, int, int]] = set()
+
+
 class Database:
     """一个库对应一个 SQLite 连接；线程内使用，不跨线程共享。"""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        #: 打开之前这个库文件就存在了吗 —— 决定"要不要念那句正在升级"
+        #: （全新库的 schema_version 也是空的，按 1 走过去会误报"从 v1 升级到 v20"）
+        self._existed = self.path.is_file()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), timeout=20.0, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
@@ -552,6 +684,12 @@ class Database:
                 f"这个库的结构版本是 {current}，比当前程序支持的 {SCHEMA_VERSION} 新："
                 "请升级 ToOak 后再打开（用旧程序打开新库会损坏数据）。"
             )
+        if current < SCHEMA_VERSION and self._existed:
+            # 命令行 / 服务端也要留一句：桌面端在打开之前已经弹过框（有备份那一步），
+            # 但 `tooak verify -L 老库` 这种用法不会有任何提示，用户下次用旧版打开
+            # 就懵了（"怎么打不开了"）。**一句 stderr**，不改任何行为。
+            # 全新库不算：它从"空"建到最新，没有任何东西在升级。
+            _note_upgrade(self.path, current, SCHEMA_VERSION)
         for version in range(current + 1, SCHEMA_VERSION + 1):
             # 有的迁移（重建表）必须**关掉外键约束**：``PRAGMA foreign_keys``
             # 只在没有待提交事务时才生效，所以开关都放在事务外面。

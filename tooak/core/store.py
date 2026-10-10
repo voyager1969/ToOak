@@ -310,6 +310,11 @@ class BlobStore:
     # ---------------------------------------------------------------- 内部
 
     @staticmethod
+    def guess_mime(ext: str) -> str:
+        """按扩展名猜 mime（公开版：改名之后 ext/mime 要跟着走，见 ``Library.rename_file``）。"""
+        return BlobStore._guess_mime(ext)
+
+    @staticmethod
     def _guess_mime(ext: str) -> str:
         if not ext:
             return "application/octet-stream"

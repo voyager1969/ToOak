@@ -6,32 +6,50 @@
 从界面上完全看不出来。所以除了语义版本号，还从 git 里取一次短提交号 + 提交日期 +
 "有没有未提交的改动"，拼成一眼能核对的一行：
 
-    ToOak v0.4.2 · 3f9c1a2（2026-09-29）· 有未提交改动
+    ToOak v0.5.0 · 3f9c1a2（2026-09-29）· 有未提交改动
 
 取不到 git（没装 git / 不是 git 目录 / 打包分发）时只显示版本号，绝不因此报错。
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from functools import lru_cache
 from pathlib import Path
 
 __all__ = ["VERSION", "APP_NAME", "build_stamp", "version_text", "version_line"]
 
 #: 语义版本号。改动大到用户能感觉出来的量级就往上走一位。
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 
 APP_NAME = "ToOak"
 
 _REPO_DIR = Path(__file__).resolve().parent.parent
 
 
+def _no_window_flags() -> int:
+    """Windows 上别让子进程闪出一个黑框（打包成窗口程序之后特别显眼）。
+
+    ``subprocess`` 默认会给控制台程序开一个控制台窗口，一次 git 一次黑框。
+    """
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 @lru_cache(maxsize=1)
 def build_stamp() -> str:
     """``提交号（日期）`` 这一截构建信息；取不到返回空串。
 
+
+    **打包成 exe 之后直接不问**：那会儿没有仓库（``_REPO_DIR`` 指向解包出来的
+    临时目录），问了也是白问 —— 而且每问一次 Windows 就闪一个黑框
     """
+    if getattr(sys, "frozen", False):
+        return ""
+
     def git(*args: str) -> str:
         return subprocess.run(
             ["git", *args],
@@ -40,6 +58,7 @@ def build_stamp() -> str:
             text=True,
             timeout=5,
             check=False,
+            creationflags=_no_window_flags(),
         ).stdout.strip()
 
     try:
@@ -58,7 +77,7 @@ def build_stamp() -> str:
 
 
 def version_text() -> str:
-    """``ToOak v0.4.2 · 3f9c1a2（2026-09-29）`` —— 标题栏、状态栏、日志都用它。"""
+    """``ToOak v0.5.0 · 3f9c1a2（2026-09-29）`` —— 标题栏、状态栏、日志都用它。"""
     stamp = build_stamp()
     return f"{APP_NAME} v{VERSION}" + (f" · {stamp}" if stamp else "")
 

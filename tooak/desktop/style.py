@@ -37,6 +37,10 @@ SELECTION_COLOR = "#2f7ff0"
 SELECTION_GLOW = "#8fb8f8"
 ATTENTION_COLOR = "#d9a52b"  # 告警：被依赖的事件更新了（黄叶那个琥珀色）
 ATTENTION_TEXT = "#8a6516"   # 告警文字色（琥珀色的深色版，白底上看得清）
+#: 搜索命中：底色用**浅琥珀**（和告警同色系，但更淡 —— 它不是"出事了"，
+#: 只是"你要找的字在这儿"），字色用深琥珀，压在原本的文字上仍然看得清
+MATCH_FILL = "#ffe9a8"
+MATCH_INK = "#7a5310"
 
 #: **事件状态** -> 颜色（边框、底色、文字）。
 #: 已完成用叶子，进行中用树枝，搁置用黄色落叶"）：
@@ -693,6 +697,56 @@ def arrow_right_icon(size: int = 16) -> QIcon:
     return _tool_icon(lambda s: arrow_right_pixmap(s), size)
 
 
+def arrow_up_pixmap(size: int = 16, color: str | None = None) -> QPixmap:
+    """上箭头（把这一行往上挪）：右箭头转 90°。"""
+    ink = QColor(color or MUTED)
+    image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    w = float(size)
+    pen = QPen(ink)
+    pen.setWidthF(max(w * 0.11, 1.4))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawLine(QPointF(w * 0.50, w * 0.80), QPointF(w * 0.50, w * 0.22))
+    painter.drawLine(QPointF(w * 0.50, w * 0.22), QPointF(w * 0.24, w * 0.48))
+    painter.drawLine(QPointF(w * 0.50, w * 0.22), QPointF(w * 0.76, w * 0.48))
+    painter.end()
+    return QPixmap.fromImage(image)
+
+
+def arrow_up_icon(size: int = 16) -> QIcon:
+    return _tool_icon(lambda s: arrow_up_pixmap(s), size)
+
+
+def arrow_down_pixmap(size: int = 16, color: str | None = None) -> QPixmap:
+    """下箭头（把这一行往下挪）：上箭头的镜像。"""
+    ink = QColor(color or MUTED)
+    image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    w = float(size)
+    pen = QPen(ink)
+    pen.setWidthF(max(w * 0.11, 1.4))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawLine(QPointF(w * 0.50, w * 0.20), QPointF(w * 0.50, w * 0.78))
+    painter.drawLine(QPointF(w * 0.50, w * 0.78), QPointF(w * 0.24, w * 0.52))
+    painter.drawLine(QPointF(w * 0.50, w * 0.78), QPointF(w * 0.76, w * 0.52))
+    painter.end()
+    return QPixmap.fromImage(image)
+
+
+def arrow_down_icon(size: int = 16) -> QIcon:
+    return _tool_icon(lambda s: arrow_down_pixmap(s), size)
+
+
 def chevron_left_pixmap(size: int = 16, color: str | None = None) -> QPixmap:
     """左尖角（上一稿）：没有横线，就一个"⟨"，和"返回"的箭头区分开。"""
     ink = QColor(color or MUTED)
@@ -971,16 +1025,54 @@ def grid_icon(size: int = 16) -> QIcon:
     return _tool_icon(lambda s: grid_pixmap(s), size)
 
 
+#: 分组图标用的**枝桠**图谱（用户给的那张：见 ``group_pixmap``）。
+#: 放在 assets 里随程序一起打包（``tooak.spec`` 整目录带过去）——
+#: 不联网取图：这是个离线优先的桌面程序。
+TWIG_ASSET = "twig.png"
+
+
+def _tinted_asset_pixmap(name: str, size: int, color: str) -> QPixmap:
+    """把一张**黑色线描**的 PNG 按给定颜色重新上色并缩到 ``size``。
+
+    做法：把原图的**不透明度当模板**（它是黑线 + 透明底），逐像素涂成目标色。
+    这样"用别人画好的形状"和"配色跟着这套界面走"两件事都要得到 ——
+    直接贴一张纯黑图标，放在一排墨绿线描图标里会显得又重又不搭。
+    """
+    path = ASSETS_DIR / name
+    if not path.is_file():
+        return QPixmap()
+    source = QImage(str(path))
+    if source.isNull():
+        return QPixmap()
+    source = source.convertToFormat(QImage.Format.Format_ARGB32)
+    ink = QColor(color)
+    tinted = QImage(source.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    tinted.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tinted)
+    painter.drawImage(0, 0, source)                    # 先把形状（含 alpha）画上去
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(tinted.rect(), ink)               # 再"只保留形状地"涂一层色
+    painter.end()
+    return QPixmap.fromImage(tinted).scaled(
+        size, size, Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
 def group_pixmap(size: int = 16, color: str | None = None) -> QPixmap:
-    """分组：一个圆角大框。"""
-    def draw(p: QPainter, w: float):
-        p.drawRoundedRect(QRectF(w * 0.12, w * 0.18, w * 0.76, w * 0.64),
-                          w * 0.08, w * 0.08)
-    return _line_icon(size, color, draw)
+    """分组：**一束枝桠**。
+
+    （``https://images.icon-icons.com/3375/PNG/512/376809_twig_v2c4694e929.png``，
+    已随程序放在 ``assets/twig.png``，按界面主色重新上色）。
+
+    以前这里画的是一个圆角大框 —— 可那个形状在这套界面里已经是"分组框本体"的
+    样子了（白板上就是一个圆角框），拿它当图标等于什么都没说。
+    """
+    return _tinted_asset_pixmap(TWIG_ASSET, size, color or ACCENT)
 
 
-def group_icon(size: int = 16) -> QIcon:
-    return _tool_icon(lambda s: group_pixmap(s), size)
+def group_icon(size: int = 16, color: str | None = None) -> QIcon:
+    return _tool_icon(lambda s: group_pixmap(s, color), size)
 
 
 def note_pixmap(size: int = 16, color: str | None = None) -> QPixmap:

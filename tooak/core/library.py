@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -106,6 +107,65 @@ LINK_LABELS = {
 #: 0.6 是**故意保守**的：宁可说"配不上"，也不能拿一份不相干的文件冒充
 #: "上一稿的那一份"（那个结论会一路带进比较结果里给用户看）。
 NAME_MATCH_FLOOR = 0.6
+
+
+def split_keywords(query: str) -> list[str]:
+    """把搜索框里的一串字拆成若干个关键词（**空格 / 制表符 / 换行都算分隔**）。
+
+    而不是"名字里要有『结构 计算』这一整串"（后者几乎永远搜不到东西）。
+    全角空格也要认（中文输入法下很容易敲出来），重复的词只留一个。
+
+    界面那边（高亮、悬停提示里的"命中文件"）用的是**同一个函数** ——
+    拆词规则只有一份，不会出现"搜到了但高亮不出来"这种对不上的情况。
+    """
+    words: list[str] = []
+    for raw in re.split(r"[\s\u3000]+", str(query or "")):
+        word = raw.strip()
+        if word and word not in words:
+            words.append(word)
+    return words
+
+
+def _escape_like(keyword: str) -> str:
+    """把关键词里的 LIKE 通配符转义掉（``%`` / ``_`` / ``\\``）。"""
+    return (keyword.replace("\\", "\\\\")
+                   .replace("%", "\\%").replace("_", "\\_"))
+
+
+def normalize_new_name(new_name: str | None, *, fallback: str) -> str:
+    """把用户输入的新文件名收拾成能落盘的那种，并**如实拒绝**改不动的输入。
+
+    规则（改名的两个入口共用：复制时改名、右键改名）：
+
+    * 空 / 只填了空白 → 用 ``fallback``（原文件名）；
+    * 前后空白去掉；
+    * **漏了扩展名就补上原扩展名**（用户往往只改主名：输入"结构计算书-终版"，
+      期望的是"结构计算书-终版.docx"，而不是一个没有类型的文件）；
+    * 带路径分隔符或 Windows 非法字符（``\\ / : * ? " < > |``）→ 直接报错，
+      **不做静默替换** —— 把 ``报告:v2`` 悄悄写成 ``报告_v2``，用户下次就找不到自己那份了。
+    """
+    text = str(new_name or "").strip()
+    if not text:
+        return fallback
+    if text != safe_filename(text):
+        raise LibraryError(
+            f"这个名字里带文件名不能用的字符（\\ / : * ? \" < > |）：{text}\n"
+            "换一个名字（扩展名可以不写，会自动沿用原来那个）"
+        )
+    original_suffix = Path(fallback).suffix
+    if original_suffix and not Path(text).suffix:
+        text += original_suffix
+    return text
+
+
+def same_file_name(left: str, right: str) -> bool:
+    """两个名字算不算"同一份"（重名判定用；大小写不敏感）。
+
+    为什么要它：库跑在 Windows 上时 ``报告.DOCX`` 与 ``报告.docx`` 在资源管理器里
+    就是同一个文件，库里当成两个名字放行的话，用户会在"打开所在文件夹"里
+    看到两份重名的东西，还分不清点哪个。Linux 上多认一层也不吃亏。
+    """
+    return str(left or "").strip().casefold() == str(right or "").strip().casefold()
 
 
 class LibraryError(Exception):
@@ -737,7 +797,7 @@ class Library:
                    (SELECT COUNT(*) FROM versions v JOIN documents d ON d.id = v.document_id
                       JOIN nodes n ON n.id = d.node_id WHERE n.project_id = p.id) AS version_count
               FROM projects p
-             ORDER BY p.name COLLATE NOCASE
+             ORDER BY p.position, p.name COLLATE NOCASE
             """
         )
         return [Project.from_row(row) for row in rows]
@@ -792,10 +852,46 @@ class Library:
         with self.db.transaction():
             self.db.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params)
 
-    def delete_project(self, project_id: int) -> None:
-        """删除项目及其全部节点/文档/版本（blob 由 gc 回收）。"""
+    def move_project(self, project_id: int, offset: int) -> bool:
+        """把一棵项目树往上/往下挪一格（侧栏工具栏的上移 / 下移按钮）。
+
+        顺序存在 ``projects.position``，挪完把整列重写成 ``0..n-1``
+        （规整，也不依赖原来的值连不连续）。
+
+        已经在头/尾时**如实返回 False** —— 界面据此说一句"已经是最上面了"，
+        而不是默默什么都不做（那会让人以为按钮坏了）。
+        """
+        order = [project.id for project in self.list_projects()]
+        if project_id not in order:
+            raise LibraryError(f"项目树不存在：{project_id}")
+        index = order.index(project_id)
+        target = index + (1 if offset > 0 else -1)
+        if not offset or target < 0 or target >= len(order):
+            return False
+        order.insert(target, order.pop(index))
         with self.db.transaction():
+            for position, value in enumerate(order):
+                self.db.execute("UPDATE projects SET position = ? WHERE id = ?",
+                                (position, value))
+        return True
+
+    def delete_project(self, project_id: int) -> None:
+        """删除项目及其全部节点/文档/版本（库里那份副本也一并回收）。
+
+        表上全是 ``ON DELETE CASCADE``，所以节点 → 事件 → 年轮 → 文件行会跟着走；
+        ``blobs`` 是 ``ON DELETE RESTRICT``（怕误删用户的东西），所以删完要显式
+        ``gc_blobs`` —— 和 :meth:`delete_document` 一条路子：**删了就把库里那份
+        副本也清掉**，不留一堆没人引用的垃圾副本（用户磁盘上的原始文件永远不动，
+        ``store.delete`` 里那道"绝对路径一律不删"的守卫管着这件事）。
+
+        另外清掉这棵树在 ``events``（活动记录）里的行：那张表**没有外键**，
+        而 SQLite 的 ``INTEGER PRIMARY KEY`` 会复用刚被删掉的号 ——
+        不清的话，新建的项目树拿到同一个 id 就会把上一位的旧记录认成自己的。
+        """
+        with self.db.transaction():
+            self.db.execute("DELETE FROM events WHERE project_id = ?", (project_id,))
             self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.gc_blobs(dry_run=False)
 
     # ---------------------------------------------------------------- 节点
 
@@ -1329,10 +1425,14 @@ class Library:
                 "DELETE FROM graph_positions WHERE project_id = ?", (project_id,)
             )
 
-    def dependency_alerts(
+    def dependency_alert_details(
         self, project_id: int | None = None
-    ) -> dict[int, list[str]]:
-        """哪些事件"依赖的东西更新了、自己还没跟"：``{事件 id: [被依赖事件标题…]}``。
+    ) -> list[dict[str, Any]]:
+        """依赖告警的**明细**（一条 = 一对"我依赖的上游更新了"）。
+
+        字段：``source_id``（我）、``dep_id``（上游）、``dep_title``、
+        ``dep_latest``（上游最新稿的时间）、``own_time``（我这一稿的时间）、
+        ``acked``（这条告警是不是被"忽略本次"了）。
 
         判据很直白（不猜、不推断）：
 
@@ -1346,6 +1446,10 @@ class Library:
         只认 ``kind = 'depends_on'``：「相关」「替代」只是人画的参考线，
         被它们连上的事件并没有"我得跟着更新"的义务 —— 不过滤的话，
         任何一条 relate_to 连线都会让白板报出假的"依赖告警"。
+
+        "忽略本次"（v20）：``dependency_acks`` 里记着"忽略到哪一次为止"，
+        上游**之后再出新稿**时这条告警又会变成未忽略（时间更大）——
+        这正是"本次"两个字的含义。
         """
         params: list[Any] = []
         # 连线类型是这里的核心条件，和"未归档"一样属于必须成立的前提，
@@ -1357,33 +1461,110 @@ class Library:
         rows = self.db.query(
             f"""
             SELECT l.from_document_id AS source_id,
+                   l.to_document_id   AS dep_id,
                    d2.title           AS dep_title,
                    (SELECT v.created_at FROM versions v WHERE v.id = d1.current_version_id)
                        AS own_time,
                    (SELECT MAX(v2.created_at) FROM versions v2 WHERE v2.document_id = d2.id)
                        AS dep_latest,
                    (SELECT MAX(v3.created_at) FROM versions v3
-                     WHERE v3.document_id = d1.id) AS own_latest
+                     WHERE v3.document_id = d1.id) AS own_latest,
+                   a.acked_dep_time AS acked_dep_time
               FROM document_links l
               JOIN documents d1 ON d1.id = l.from_document_id
               JOIN documents d2 ON d2.id = l.to_document_id
               JOIN nodes n1     ON n1.id = d1.node_id
+              LEFT JOIN dependency_acks a
+                     ON a.from_document_id = l.from_document_id
+                    AND a.to_document_id = l.to_document_id
               {where}
             """,
             params,
         )
-        alerts: dict[int, list[str]] = {}
+        details: list[dict[str, Any]] = []
+        seen: set[tuple[int, int]] = set()
         for row in rows:
             dep_latest = row["dep_latest"] or ""
             own_time = row["own_time"] or row["own_latest"] or ""
-            if dep_latest and own_time and dep_latest > own_time:
-                titles = alerts.setdefault(int(row["source_id"]), [])
-                title = str(row["dep_title"])
-                # 同一对事件之间可能记了「依赖 + 相关」两条线：标题只报一次，
+            if not (dep_latest and own_time and dep_latest > own_time):
+                continue
+            pair = (int(row["source_id"]), int(row["dep_id"]))
+            if pair in seen:
+                # 同一对事件之间可能记了「依赖 + 相关」两条线：只报一次，
                 # 否则告警里同一个名字出现两遍，用户会以为有两个上游
-                if title not in titles:
-                    titles.append(title)
+                continue
+            seen.add(pair)
+            acked_time = str(row["acked_dep_time"] or "")
+            details.append({
+                "source_id": pair[0],
+                "dep_id": pair[1],
+                "dep_title": str(row["dep_title"]),
+                "dep_latest": dep_latest,
+                "own_time": own_time,
+                # 忽略过的告警在上游**又出了新稿**之后要重新提醒：
+                # 只要上游最新稿的时间比"忽略时那个时间"更大，就不算忽略
+                "acked": bool(acked_time) and acked_time >= dep_latest,
+            })
+        return details
+
+    def dependency_alerts(
+        self, project_id: int | None = None
+    ) -> dict[int, list[str]]:
+        """哪些事件"依赖的东西更新了、自己还没跟"：``{事件 id: [被依赖事件标题…]}``。
+
+        只算**没被"忽略本次"**的那些（见 :meth:`dependency_alert_details`）；
+        判据与忽略规则都写在那边。
+        """
+        alerts: dict[int, list[str]] = {}
+        for row in self.dependency_alert_details(project_id):
+            if row["acked"]:
+                continue
+            titles = alerts.setdefault(int(row["source_id"]), [])
+            if row["dep_title"] not in titles:
+                titles.append(str(row["dep_title"]))
         return alerts
+
+    def ack_dependency_alerts(self, document_id: int) -> list[dict[str, Any]]:
+        """「忽略本次依赖告警」：把这一枝**现在**挂着的告警都记成"我知道了"。
+
+        :returns: 被忽略的那些告警（``{dep_id, dep_title, dep_latest, acked_dep_time}``），
+            界面拿它写一句"已忽略对「甲、乙」的告警"，撤销也靠它还原。
+        """
+        pending = [row for row in self.dependency_alert_details()
+                   if int(row["source_id"]) == int(document_id)]
+        now = utcnow_iso()
+        with self.db.transaction():
+            for row in pending:
+                self.db.execute(
+                    "INSERT INTO dependency_acks(from_document_id, to_document_id, "
+                    "acked_at, acked_dep_time) VALUES(?,?,?,?) "
+                    "ON CONFLICT(from_document_id, to_document_id) DO UPDATE SET "
+                    "acked_at = excluded.acked_at, acked_dep_time = excluded.acked_dep_time",
+                    (int(document_id), int(row["dep_id"]), now, str(row["dep_latest"])),
+                )
+        return pending
+
+    def clear_dependency_alerts(self, document_id: int) -> None:
+        """把这一枝"忽略过的告警"清掉（= 恢复提醒）。"""
+        with self.db.transaction():
+            self.db.execute(
+                "DELETE FROM dependency_acks WHERE from_document_id = ?",
+                (int(document_id),),
+            )
+
+    def dependency_acks(self, document_id: int) -> list[dict[str, Any]]:
+        """这一枝忽略过哪些告警（用来决定菜单里显不显示"恢复依赖告警"）。"""
+        return [
+            dict(row)
+            for row in self.db.query(
+                "SELECT a.to_document_id AS dep_id, d.title AS dep_title, "
+                "a.acked_at, a.acked_dep_time FROM dependency_acks a "
+                "LEFT JOIN documents d ON d.id = a.to_document_id "
+                "WHERE a.from_document_id = ? ORDER BY a.acked_at DESC, a.to_document_id",
+                (int(document_id),),
+            )
+        ]
+
 
     # --------------------------------------------- 白板：说明文本框 / 分组 / 连接曲度
 
@@ -1391,7 +1572,10 @@ class Library:
     CARD_KINDS = ("note", "file", "link")
     #: 卡片字段的白名单（更新时只认这些列，避免 SQL 拼接出意外）
     _CARD_FIELDS = ("kind", "x", "y", "w", "h", "title", "text", "path", "url",
-                    "origin", "color")
+                    "origin", "color", "attached_document_id")
+    #: 读卡片时带的列（顺序与 board_cards 的老返回保持一致，新列挂在末尾）
+    _CARD_COLUMNS = ("id, kind, x, y, w, h, title, text, path, url, origin, color, "
+                     "attached_document_id")
 
     def board_cards(self, project_id: int,
                     kind: str | None = None) -> list[dict[str, Any]]:
@@ -1399,6 +1583,9 @@ class Library:
 
         卡片是"待归档的引用"：文件卡片只记路径，绝不复制、绝不移动用户的文件；
         转为事件时才真正进库（见 :meth:`promote_card_to_event`）。
+
+        ``attached_document_id``：这张卡片**吸附**在哪个事件枝上（空 = 自由摆放）。
+        吸附在事件枝上的功能"。
         """
         clauses = ["project_id = ?"]
         params: list[Any] = [project_id]
@@ -1408,7 +1595,7 @@ class Library:
         return [
             dict(row)
             for row in self.db.query(
-                f"SELECT id, kind, x, y, w, h, title, text, path, url, origin, color "
+                f"SELECT {self._CARD_COLUMNS} "
                 f"FROM board_cards WHERE {' AND '.join(clauses)} ORDER BY id",
                 params,
             )
@@ -1416,8 +1603,8 @@ class Library:
 
     def get_board_card(self, card_id: int) -> dict[str, Any] | None:
         row = self.db.query_one(
-            "SELECT id, project_id, kind, x, y, w, h, title, text, path, url, "
-            "origin, color FROM board_cards WHERE id = ?",
+            f"SELECT id, project_id, {self._CARD_COLUMNS} "
+            "FROM board_cards WHERE id = ?",
             (card_id,),
         )
         return dict(row) if row is not None else None
@@ -1425,7 +1612,8 @@ class Library:
     def add_board_card(self, project_id: int, kind: str, x: float, y: float, *,
                        title: str = "", text: str = "", path: str = "",
                        url: str = "", w: float = 260.0, h: float = 0.0,
-                       origin: str = "user", color: str = "") -> int:
+                       origin: str = "user", color: str = "",
+                       attached_document_id: int | None = None) -> int:
         """在白板上放一张卡片（说明框 / 文件素材 / 链接）。"""
         if kind not in self.CARD_KINDS:
             raise LibraryError(f"不认识的卡片类型：{kind}")
@@ -1433,15 +1621,17 @@ class Library:
         with self.db.transaction():
             cursor = self.db.execute(
                 "INSERT INTO board_cards(project_id, kind, x, y, w, h, title, text, "
-                "path, url, origin, color, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "path, url, origin, color, attached_document_id, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (project_id, kind, float(x), float(y), float(w), float(h), title, text,
-                 path, url, origin, color, now, now),
+                 path, url, origin, color,
+                 int(attached_document_id) if attached_document_id else None,
+                 now, now),
             )
             return int(cursor.lastrowid)
 
     def update_board_card(self, card_id: int, **fields: Any) -> None:
-        """改卡片（位置、大小、标题、正文、路径…）。只认白名单里的列。"""
+        """改卡片（位置、大小、标题、正文、路径、吸附在哪个事件枝…）。只认白名单里的列。"""
         updates: list[str] = []
         params: list[Any] = []
         for key, value in fields.items():
@@ -1461,6 +1651,46 @@ class Library:
                 f"UPDATE board_cards SET {', '.join(updates)} WHERE id = ?", params
             )
 
+    def attach_board_card(self, card_id: int, document_id: int | None, *,
+                          card_height: float | None = None) -> None:
+        """把一张白板卡片**吸附**到某个事件枝上（``document_id=None`` = 取消吸附）。
+
+        为什么要单独一个方法：吸附要**顺便把便签挪到卡片旁边**（贴左边外侧），
+        这样用户看到的就是"啪"一下贴上去，而不是"设置了一个属性、位置还得自己拖"。
+        之后卡片一挪，这张便签跟着一起挪（见 ``desktop/project_view``）。
+
+        :param card_height: 那张事件枝卡片**实际有多高**（标题折行时它比默认的
+            ``CARD_H`` 高）。界面知道这个数就传进来，便签才会贴在那张卡的正下方；
+            不传按默认高度算（内核不认识界面字体，算不出真实高度）。
+        :raises LibraryError: 卡片或事件枝不存在。
+        """
+        card = self.get_board_card(card_id)
+        if card is None:
+            raise LibraryError(f"白板卡片不存在：{card_id}")
+        if document_id is None:
+            # 取消吸附：写回 **NULL**（不是 0）—— 这一列是外键，0 不是任何事件枝的 id，
+            # 直接写 0 会被外键约束顶回来（实测 FOREIGN KEY constraint failed）。
+            # 也不能走 update_board_card：它按"None = 不改这一列"处理，传不进去。
+            with self.db.transaction():
+                self.db.execute(
+                    "UPDATE board_cards SET attached_document_id = NULL, "
+                    "updated_at = ? WHERE id = ?", (utcnow_iso(), card_id))
+            return
+        document = self.get_document(document_id)
+        if document is None:
+            raise LibraryError(f"事件枝不存在：{document_id}")
+        patch: dict[str, Any] = {"attached_document_id": int(document_id)}
+        node = self.get_node(document.node_id)
+        position = (self.document_positions(node.project_id).get(document_id)
+                    if node is not None else None)
+        if position is not None and card["kind"] == "note":
+            # 贴到**卡片正下方**（左边缘对齐、下边留一点缝），像给这张卡配了一句注脚。
+            # 事件一多就分不清哪张便签跟着哪张卡。
+            from .projectgraph import CARD_H
+            height = float(card_height) if card_height else CARD_H
+            patch.update({"x": position[0], "y": position[1] + height + 12.0})
+        self.update_board_card(card_id, **patch)
+
     def delete_board_card(self, card_id: int) -> None:
         """删掉一张卡片（只是白板上的便利贴/引用，**不碰任何文件与归档**）。"""
         with self.db.transaction():
@@ -1472,7 +1702,8 @@ class Library:
         """说明框 = kind='note' 的卡片（保持老接口，界面/测试都不用改）。"""
         return [
             {"id": card["id"], "x": card["x"], "y": card["y"], "width": card["w"],
-             "text": card["text"], "color": card["color"]}
+             "text": card["text"], "color": card["color"],
+             "attached_document_id": int(card.get("attached_document_id") or 0)}
             for card in self.board_cards(project_id, kind="note")
         ]
 
@@ -1640,7 +1871,8 @@ class Library:
         groups: list[dict[str, Any]] = []
         for row in self.db.query(
             "SELECT id, project_id, name, note, color, sort_key, x, y, w, h, manual, "
-            "created_at FROM board_groups WHERE project_id = ? ORDER BY sort_key, id",
+            "collapsed, created_at FROM board_groups "
+            "WHERE project_id = ? ORDER BY sort_key, id",
             (project_id,),
         ):
             group = dict(row)
@@ -1664,6 +1896,8 @@ class Library:
 
         ``document_ids`` 可以是空的（**空组**）：空组靠自己的矩形画出来，
         之后往里新建/拖入事件即可；``manual=True`` 表示大小由用户定、不跟着成员收紧。
+        给了成员时，它们会**从原来那个组里退出来**（一个事件只在一个组下，见
+        :meth:`add_group_members`）。
         """
         now = utcnow_iso()
         with self.db.transaction():
@@ -1696,6 +1930,21 @@ class Library:
             if cursor.rowcount == 0:
                 raise LibraryError(f"这个分组已经不存在了：{group_id}")
 
+    def set_group_position(self, group_id: int, x: float, y: float) -> None:
+        """**只挪位置**：大小和"跟不跟着成员收紧"都不动。
+
+        折叠起来的分组拖的是那一条标题栏（见 ``BoardGroupItem.mouseReleaseEvent``）：
+        那种情况不能走 ``set_group_rect`` —— 它会连带把 ``w``/``h`` 写成标题栏
+        那一条的尺寸、还把这个组标成"手工尺寸"，于是再展开就只剩一条扁框。
+        """
+        with self.db.transaction():
+            cursor = self.db.execute(
+                "UPDATE board_groups SET x = ?, y = ?, updated_at = ? WHERE id = ?",
+                (float(x), float(y), utcnow_iso(), group_id),
+            )
+            if cursor.rowcount == 0:
+                raise LibraryError(f"这个分组已经不存在了：{group_id}")
+
     def set_group_auto(self, group_id: int) -> None:
         """这个组回到"框跟着成员收紧"。"""
         with self.db.transaction():
@@ -1703,6 +1952,24 @@ class Library:
                 "UPDATE board_groups SET manual = 0, updated_at = ? WHERE id = ?",
                 (utcnow_iso(), group_id),
             )
+
+    def set_group_collapsed(self, group_id: int, collapsed: bool = True) -> None:
+        """
+
+        折叠**只影响怎么看**：成员事件、它们的位置、连线和文件一个都不动 ——
+        展开回来还是原来那个版图。所以这里只写 ``collapsed`` 这一列，
+        ``x/y/w/h`` 与 ``manual`` 都不碰（折叠时画出来的是标题栏那一条，
+        它由界面按这几列现算，见 ``BoardGroupItem.fit_to_members``）。
+
+        和 ``rename_group`` 一样：组已经不在时如实抛错，不静默成功。
+        """
+        with self.db.transaction():
+            cursor = self.db.execute(
+                "UPDATE board_groups SET collapsed = ?, updated_at = ? WHERE id = ?",
+                (1 if collapsed else 0, utcnow_iso(), group_id),
+            )
+            if cursor.rowcount == 0:
+                raise LibraryError(f"这个分组已经不存在了：{group_id}")
 
     def rename_group(self, group_id: int, name: str | None = None,
                      note: str | None = None, color: str | None = None) -> None:
@@ -1731,10 +1998,15 @@ class Library:
 
     def set_group_members(self, group_id: int,
                           document_ids: Iterable[int]) -> None:
-        """把组里的成员事件记成给定的这一批（传进来的就是全部成员）。"""
+        """把组里的成员事件记成给定的这一批（传进来的就是全部成员）。
+
+        所以要塞进这一组的成员会先**从别的组退出来** —— 这里和
+        :meth:`add_group_members` 走同一条路，别处不需要各自记得这件事。
+        """
         wanted = {int(item) for item in document_ids}
         now = utcnow_iso()
         with self.db.transaction():
+            self._leave_other_groups(group_id, wanted)
             self.db.execute("DELETE FROM board_group_members WHERE group_id = ?",
                             (group_id,))
             for document_id in sorted(wanted):
@@ -1744,15 +2016,52 @@ class Library:
                     (group_id, document_id, now),
                 )
 
-    def add_group_members(self, group_id: int, document_ids: Iterable[int]) -> None:
+    def add_group_members(self, group_id: int,
+                          document_ids: Iterable[int]) -> list[dict[str, Any]]:
+        """把事件加进这一组；**它们会从原来那个组里退出来**（一个事件只在一个组下）。
+
+        :returns: 被"挪走"的那些事件原来在哪个组：``[{document_id, group_id, name}, …]``
+            —— 界面拿它写一句"已从「甲组」移到「乙组」"。用户看不到这句话时，
+            只会发现"我加进乙组了，可甲组里怎么没了"。
+        """
+        ids = [int(item) for item in document_ids]
         now = utcnow_iso()
         with self.db.transaction():
-            for document_id in document_ids:
+            moved = self._leave_other_groups(group_id, ids)
+            for document_id in ids:
                 self.db.execute(
                     "INSERT OR IGNORE INTO board_group_members(group_id, document_id, "
                     "added_at) VALUES(?,?,?)",
-                    (group_id, int(document_id), now),
+                    (group_id, document_id, now),
                 )
+        return moved
+
+    def _leave_other_groups(self, group_id: int,
+                            document_ids: Iterable[int]) -> list[dict[str, Any]]:
+        """让这几个人从**别的**分组里退出来，返回他们原来待的组（给界面报一句）。
+
+        为什么放在内核而不是界面：唯一索引是库这一层的规矩（v19），
+        任何一条 INSERT 想往第二个组里塞同一个人都会被 SQLite 拦下来 ——
+        界面如果忘了先退组，就会收到一条 `IntegrityError`，而不是"加进去了"。
+        """
+        moved: list[dict[str, Any]] = []
+        for document_id in {int(item) for item in document_ids}:
+            rows = self.db.query(
+                "SELECT m.group_id, g.name FROM board_group_members m "
+                "JOIN board_groups g ON g.id = m.group_id "
+                "WHERE m.document_id = ? AND m.group_id != ?",
+                (document_id, int(group_id)),
+            )
+            for row in rows:
+                moved.append({"document_id": document_id,
+                              "group_id": int(row["group_id"]),
+                              "name": str(row["name"] or "")})
+                self.db.execute(
+                    "DELETE FROM board_group_members WHERE group_id = ? AND "
+                    "document_id = ?",
+                    (int(row["group_id"]), document_id),
+                )
+        return moved
 
     def remove_group_members(self, group_id: int,
                              document_ids: Iterable[int]) -> None:
@@ -1765,7 +2074,10 @@ class Library:
                 )
 
     def groups_of_document(self, document_id: int) -> list[dict[str, Any]]:
-        """这个事件属于哪些组。"""
+        """这个事件属于哪些组。
+
+        列表是为了别处的调用方不用改；要"就取那一个"用 :meth:`group_of_document`。
+        """
         return [
             dict(row)
             for row in self.db.query(
@@ -1775,6 +2087,15 @@ class Library:
                 (document_id,),
             )
         ]
+
+    def group_of_document(self, document_id: int) -> dict[str, Any] | None:
+        """这个事件在**哪一个**分组下（不在任何组里返回 None）。
+
+        左侧那棵树要把事件挂在某一个组节点下面，用的就是它 ——
+        比 ``groups_of_document()[0]`` 更直白：没有组时返回 None，不是 IndexError。
+        """
+        found = self.groups_of_document(document_id)
+        return found[0] if found else None
 
     def set_link_curve(self, from_document_id: int, to_document_id: int,
                        curve: float, kind: str = "depends_on") -> None:
@@ -1952,6 +2273,9 @@ class Library:
                 # 它的第一稿会直接从被删事件的那个号往后排（一上来就是 v4）
                 self.db.execute("DELETE FROM meta WHERE key = ?",
                                 (self._seq_meta_key(document_id),))
+                # 活动记录那张表没有外键，也会被 rowid 复用牵连（见 delete_project）
+                self.db.execute("DELETE FROM events WHERE document_id = ?",
+                                (document_id,))
                 self.db.execute("DELETE FROM documents WHERE id = ?", (document_id,))
             # 连各稿记录一起抹掉后，回收库里没人再引用的副本
             self.gc_blobs(dry_run=False)
@@ -2436,7 +2760,8 @@ class Library:
 
     def register_file_to_version(self, source_version_id: int, file_id: int,
                                 target_version_id: int, *,
-                                role: str | None = None) -> dict[str, Any]:
+                                role: str | None = None,
+                                new_name: str | None = None) -> dict[str, Any]:
         """把某一稿里的某一份文件**另外登记到另一稿**（界面上的「复制一份到这一稿」）。
 
         在文件库里面创建一个复制版本，作为最新的稿件（注意区分我可能选择的
@@ -2466,11 +2791,17 @@ class Library:
         如实告诉你它登记在哪个环节 —— 一稿里同一份文件留两个入口，用户分不清点哪个。
         （想换环节用拖放，那是 ``move_file_to_role`` 的事。）
 
-        :returns: ``{added, name, role, role_label, source_seq, target_seq,
-            existing_role_label, copied_into_library}``（``copied_into_library``
-            为 True 表示这次真的把字节复制进库了）
+            文件名框让用户可以编辑修改名字"）。不给就沿用原文件名。
+            内容是同一份，只是这一稿里那份文件叫另一个名字 —— 库里放的也是这个名字
+            （``files/<别名>/<新名字>``），所以导出、打开所在文件夹看到的都是新名字。
+            **用户磁盘上的原文件不改名**（本库从不改用户的文件）。
+        :returns: ``{added, name, old_name, renamed, role, role_label, source_seq,
+            target_seq, existing_role_label, copied_into_library}``（``name`` 是
+            **这一稿里那份文件最后叫什么**——用户改过名时就是新名字；``renamed``
+            表示这次确实换了名字；``copied_into_library`` 为 True 表示这次真的把
+            字节复制进库了）
         :raises LibraryError: 版本不存在 / 不是同一根事件枝 / 这一稿里没有这个文件 /
-            内容已不可用 / 环节不认识。
+            内容已不可用 / 环节不认识 / 新名字不合法。
         """
         role = str(role or "").strip() or None
         if role is not None and role not in ROLE_LABELS:
@@ -2495,6 +2826,8 @@ class Library:
             # 旧库导入的数据里可能有没见过的角色：当成附件，别写进一个界面不认识的字符串
             target_role = "attachment"
 
+        copy_name = normalize_new_name(new_name, fallback=item.name)
+
         # 内容还在不在、还是不是当初那一份（只 stat，不读内容）
         check = self.check_version_files(source_version_id)
         for bucket, why in (("missing", "已经不在原处"),
@@ -2506,11 +2839,12 @@ class Library:
                     "或者把现在磁盘上那份重新拖进方框（那会正常归档）"
                 )
 
-        existing = next((row for row in target_version.files if row.name == item.name), None)
+        existing = next((row for row in target_version.files
+                         if same_file_name(row.name, copy_name)), None)
         if existing is not None:
             return {
                 "added": False,
-                "name": item.name,
+                "name": existing.name,
                 "role": existing.role,
                 "role_label": ROLE_LABELS.get(existing.role, existing.role),
                 "source_seq": source.seq,
@@ -2528,7 +2862,7 @@ class Library:
         # 不能占着 SQLite 的写锁；界面那边也是丢给后台任务跑的）。
         source_path = self._file_path(item)
         info, stored_name, _mtime = self._store_spec(
-            FileSpec(path=source_path, role=target_role, name=raw["name"]),
+            FileSpec(path=source_path, role=target_role, name=copy_name),
             document, mode="copy",
         )
         blob_id = self._insert_blob(info)
@@ -2577,7 +2911,9 @@ class Library:
             )
         return {
             "added": True,
-            "name": item.name,
+            "name": stored_name,
+            "old_name": item.name,
+            "renamed": stored_name != item.name,
             "role": target_role,
             "role_label": ROLE_LABELS.get(target_role, target_role),
             "source_seq": source.seq,
@@ -2587,6 +2923,118 @@ class Library:
             "size": info.size,
             "stored_path": info.rel_path,
         }
+
+    def rename_file(self, version_id: int, file_id: int, new_name: str) -> dict[str, Any]:
+        """给**某一稿里的一行文件**改名（界面上文件行的右键「改名…」）。
+
+
+        改的是**库里记的那个名字**（``version_files.name``）——所以改完这一稿的
+        文件清单、导出、Word 比较、年轮上写的名字统统跟着变，而不是只换个显示。
+
+        四条纪律：
+
+        * **只改这一稿这一行**：别的稿各自记着自己那份名字，一个字都不动
+          （同一份资料在不同时期可以叫不同名字 —— 用户本来就是每稿改名的习惯）。
+        * **绝不改磁盘上用户的原文件**：引用模式下这一行还指着库外那个路径，
+          改名只是"库里怎么称呼它"；库内副本（copy 模式）是库自己的文件，
+          见下一条。
+        * **库内副本要是"只属于这一行"，就把实体文件一起改名**：``files/<别名>/<新名字>``，
+          ``blobs.rel_path`` 跟着更新（连带 ext/mime）。被别的稿共用（内容相同
+          被去重成一行 blob）时**不动实体文件** —— 那会影响别人那一稿看到的路径。
+        * **同一稿里不许重名**：目标名字在这一稿里已经有另一行了，就直接报错，
+          而不是让两行同名（用户分不清点哪个）。
+
+        :returns: ``{name, old_name, role, role_label, renamed_copy: bool}``
+        :raises LibraryError: 版本/文件不存在、名字非法、同一稿里重名。
+        """
+        version = self.get_version(version_id)
+        if version is None:
+            raise LibraryError(f"版本不存在：{version_id}")
+        document = self.get_document(version.document_id)
+        item = next((row for row in version.files if row.id == file_id), None)
+        if item is None:
+            raise LibraryError(f"这一稿里没有这个文件：{file_id}")
+
+        old_name = item.name
+        clean = normalize_new_name(new_name, fallback=old_name)
+        if clean == old_name:
+            return {
+                "name": old_name, "old_name": old_name, "role": item.role,
+                "role_label": ROLE_LABELS.get(item.role, item.role),
+                "renamed_copy": False,
+            }
+        clash = next((row for row in version.files
+                      if row.id != file_id and same_file_name(row.name, clean)), None)
+        if clash is not None:
+            raise LibraryError(
+                f"这一稿里已经有一份叫「{clean}」的文件了"
+                f"（在「{ROLE_LABELS.get(clash.role, clash.role)}」里）：另起一个名字，"
+                "或者先把它删掉/换到别的稿"
+            )
+
+        raw = self.db.query_one("SELECT * FROM version_files WHERE id = ?", (item.id,))
+        renamed_copy = self._rename_private_copy(raw, clean)
+
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE version_files SET name = ? WHERE id = ?", (clean, item.id)
+            )
+            # 主文件那一行的名字同时写在 versions.source_name 上（导出/差异都读它）
+            self._resync_version_primary(version.id)
+            self._log_event(
+                "file_renamed",
+                document_id=version.document_id, version_id=version.id,
+                node_id=document.node_id if document else None,
+                message=f"v{version.seq} · {old_name} → {clean}"
+                        + ("（库内副本一并改名）" if renamed_copy else ""),
+            )
+        return {
+            "name": clean,
+            "old_name": old_name,
+            "role": item.role,
+            "role_label": ROLE_LABELS.get(item.role, item.role),
+            "renamed_copy": renamed_copy,
+        }
+
+    def _rename_private_copy(self, raw, new_name: str) -> bool:
+        """库内副本若**只被这一行引用**，把实体文件也改成新名字（返回是否改了）。
+
+        为什么要这一手：库内存储时那份文件真的躺在 ``files/<别名>/`` 下，
+        记录改了、文件名没改，"打开所在文件夹"看到的还是老名字，两边对不上。
+        但**被别的稿共用时绝对不能动**：同一份内容被去重成一行 blob，
+        改路径等于把别人那一稿的文件也改了名。
+        先改磁盘、再改数据库（磁盘失败就不动库，不会留下"记录改了文件没了"）。
+        """
+        blob_id = raw["blob_id"]
+        row = self.db.query_one("SELECT * FROM blobs WHERE id = ?", (blob_id,))
+        if row is None or str(row["source"]) != SOURCE_STORE or not row["rel_path"]:
+            return False                      # 库外引用：那份是用户的文件，不碰
+        shared = int(self.db.scalar(
+            "SELECT COUNT(*) FROM version_files WHERE blob_id = ?", (blob_id,)
+        ) or 0)
+        if shared > 1:
+            return False                      # 还有别的稿在用它，动路径会牵连别人
+        old_path = self.store.resolve(str(row["rel_path"]))
+        if not old_path.is_file() or old_path.name == new_name:
+            return False
+        new_path = old_path.with_name(new_name)
+        if new_path.exists():
+            return False                      # 别名目录里撞名了，宁可不改实体文件
+        try:
+            old_path.rename(new_path)
+        except OSError as error:
+            raise LibraryError(
+                f"库内那份文件改名没成功（{error}）：先关掉正在打开它的程序再试"
+            ) from error
+        rel_path = str(row["rel_path"])
+        new_rel = str(Path(rel_path).with_name(new_name)).replace("\\", "/")
+        suffix = suffix_of(new_name)
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE blobs SET rel_path = ?, ext = ?, mime = ? WHERE id = ?",
+                (new_rel, suffix, self.store.guess_mime(suffix), blob_id),
+            )
+        return True
 
     def _resync_version_primary(self, version_id: int) -> None:
         """把 ``versions`` 上的主文件指针与摘要重算成"跟着这一稿的文件集合走"。
@@ -3313,7 +3761,7 @@ class Library:
                 kind="binary",
                 summary=f"这一稿还没有文件（上一稿的 {len(old.files)} 个文件都还没登记进来）",
                 details=[
-                    "把文件拖进对应的方框、或右键文件卡片「加入到这一稿…」，它就会出现。",
+                    "把文件拖进对应的方框、或右键文件卡片「添加文件到「方框」…」，它就会出现。",
                     "在这之前，这些文件仍然能在历史稿和上一稿里看到。",
                 ],
             )
@@ -3586,7 +4034,10 @@ class Library:
         返回的字典（界面直接照它拼菜单，不再自己算业务）：
 
         * ``is_word``：这份文件是不是 Word 类型（不是的话菜单里整块不出现）；
-        * ``word_available`` / ``word_reason``：本机 Word 能不能用（不能用时置灰 + 写明原因）；
+        * ``word_available`` / ``word_reason``：本机 Word / WPS 能不能用
+          （不能用时置灰 + 写明原因）；
+        * ``word_engine``：本机装的是哪一套（``"Word"`` / ``"WPS 文字"`` /
+          ``"Word 或 WPS"``）—— 菜单标题照它写，用户才知道点下去谁会跳出来；
         * ``candidates``：更早的稿里能比的那些，**从近到远**，
           每条 ``{version_id, file_id, seq, name, label, when, is_previous}``；
         * ``reason``：一个候选都没有时的人话（写进置灰项的提示里）。
@@ -3612,6 +4063,8 @@ class Library:
             "is_word": bool(target is not None and wordcompare.is_word_file(target.name)),
             "word_available": wordcompare.available(),
             "word_reason": wordcompare.unavailable_reason(),
+            "word_engine": wordcompare.engine_label(),
+            "word_hint": wordcompare.engine_hint(),
             "candidates": [],
             "reason": "",
         }
@@ -4471,20 +4924,38 @@ class Library:
     ) -> list[dict[str, Any]]:
         """按标题 / 文件名检索；``include_text=True`` 时附带已抽取文本的全文匹配。
 
+        ``结构 计算`` 找的是"名字里既有『结构』又有『计算』"的那些事件，
+        而不是把两个词当成一整串去比。每个词可以落在**标题**上、也可以落在
+        **文件名**上（同一个词也允许一处命中即可），词与词之间是 AND ——
+        这正是用户输入多个词时的本意：越写越具体。
+
         返回条目含文档、节点路径与最新版本，便于界面直接渲染成一棵树。
         """
-        keyword = (query or "").strip()
-        if not keyword:
+        keywords = split_keywords(query)
+        if not keywords:
             return []
         # 关键词里的 % / _ 是 LIKE 的通配符：不转义的话搜"报告_2024"会命中"报告X2024"，
         # 搜一个"%"直接返回全库
-        escaped = (keyword.replace("\\", "\\\\")
-                          .replace("%", "\\%").replace("_", "\\_"))
-        like = f"%{escaped}%"
+        likes = [f"%{_escape_like(keyword)}%" for keyword in keywords]
         # 已有 WHERE 后面，于是"已归档""别的项目"全都被 OR 放回来了
         # （`... AND 标题 LIKE ? AND 项目 = ? OR 全文命中` 的优先级就是这么走的）。
-        # 占位符顺序要和 params 一一对应：匹配分支在前，项目过滤在后。
-        params: list[Any] = [like, like]
+        # 现在按词 AND 起来，每个词内部是"标题 or 文件名（or 全文）"。
+        branches: list[str] = []
+        params: list[Any] = []
+        for like in likes:
+            if include_text:
+                branches.append(
+                    "((d.title LIKE ? ESCAPE '\\' OR vf.name LIKE ? ESCAPE '\\')"
+                    " OR d.id IN (SELECT v.document_id FROM versions v "
+                    "JOIN version_text vt ON vt.version_id = v.id "
+                    "WHERE vt.text LIKE ? ESCAPE '\\'))"
+                )
+                params += [like, like, like]
+            else:
+                branches.append(
+                    "(d.title LIKE ? ESCAPE '\\' OR vf.name LIKE ? ESCAPE '\\')"
+                )
+                params += [like, like]
         sql = """
             SELECT DISTINCT d.id AS document_id
               FROM documents d
@@ -4492,15 +4963,7 @@ class Library:
               LEFT JOIN version_files vf ON vf.version_id = v.id
              WHERE d.status = 'active'
         """
-        if include_text:
-            sql += " AND ((d.title LIKE ? ESCAPE '\\' OR vf.name LIKE ? ESCAPE '\\')" \
-                   " OR d.id IN (SELECT v.document_id FROM versions v " \
-                   "JOIN version_text vt ON vt.version_id = v.id " \
-                   "WHERE vt.text LIKE ? ESCAPE '\\'))"
-            params.append(like)
-        else:
-            # 标题/文件名这两个占位符就是上面初始化的那两个 like，不用再加
-            sql += " AND (d.title LIKE ? ESCAPE '\\' OR vf.name LIKE ? ESCAPE '\\')"
+        sql += " AND " + " AND ".join(branches)
         if project_id is not None:
             sql += " AND d.node_id IN (SELECT id FROM nodes WHERE project_id = ?)"
             params.append(project_id)

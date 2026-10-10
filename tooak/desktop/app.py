@@ -23,6 +23,7 @@ from ..version import version_line, version_text
 from .main_window import MainWindow
 from .paths import read_last_library, write_last_library
 from .style import apply_theme, app_icon, watch_color_scheme
+from .upgrade import ensure_library_is_current
 
 
 __all__ = ["run", "default_library_path", "read_last_library", "write_last_library"]
@@ -126,6 +127,11 @@ def run(argv: list[str] | None = None) -> int:
             # 有库（记住了或默认位置已存在）则走下面正常加载。
             create_demo_library(library_root).close()
         else:
+            # **打开之前先把关**：老库要升级是不可逆的（升完旧版 ToOak 打不开它），
+            # 所以先说清楚、并给一条"先备份再升级"的退路 —— 见 desktop/upgrade.py。
+            # 用户选择"先不动"就不动这个库（返回 False），直接退出。
+            if not ensure_library_is_current(library_root):
+                return 0
             Library.open_or_create(library_root).close()
     except Exception as error:  # 库路径不可用时给出人话提示
         print(f"无法打开库 {library_root}：{error}", file=sys.stderr)

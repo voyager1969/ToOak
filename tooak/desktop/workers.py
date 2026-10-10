@@ -102,6 +102,8 @@ class WordCompareFinished:
     error: str = ""
     #: "v2 · 提交_v2.docx → v3 · 提交_v3.docx"，界面提示里写清楚比的是哪两份
     labels: str = ""
+    #: 这次是谁干的（``Word`` / ``WPS``）—— 装了两套 Office 的机器上要写出来
+    engine: str = ""
 
 
 @dataclass
@@ -522,6 +524,7 @@ class WordCompareJob(_Job):
         self.events.put(WordCompareFinished(
             self.id, True, output=result.output, revisions=result.revisions,
             message=f"共 {result.revisions} 处修订", labels=labels,
+            engine=result.kind_label,
         ))
 
     def report_failure(self, error: BaseException) -> None:  # noqa: D102
@@ -550,18 +553,22 @@ class FileCopyJob(_Job):
     """
 
     def __init__(self, library_root: str | Path, source_version_id: int, file_id: int,
-                 target_version_id: int):
+                 target_version_id: int, *, new_name: str | None = None):
         super().__init__(library_root)
         self.source_version_id = source_version_id
         self.file_id = file_id
         self.target_version_id = target_version_id
+        #: 用户在那个确认框里改过的名字；``None`` = 沿用原来的名字（名字本身由
+        #: 内核的 ``normalize_new_name`` 校验，界面不替它做决定）
+        self.new_name = new_name
         self._thread.name = f"ToOakCopy-{self.id}"
 
     def run(self) -> None:  # noqa: D102
         try:
             with Library.open(self.library_root) as library:
                 result = library.register_file_to_version(
-                    self.source_version_id, self.file_id, self.target_version_id
+                    self.source_version_id, self.file_id, self.target_version_id,
+                    new_name=self.new_name,
                 )
         except LibraryError as error:
             self.events.put(FileCopyFinished(self.id, False, error=str(error)))

@@ -5,7 +5,8 @@
 """
 
 from .library import Library, ArchiveResult, LibraryError  # noqa: F401
-from .db import Database  # noqa: F401
+from .db import Database, read_schema_version  # noqa: F401
 from .store import BlobStore  # noqa: F401
 
-__all__ = ["Library", "ArchiveResult", "LibraryError", "Database", "BlobStore"]
+__all__ = ["Library", "ArchiveResult", "LibraryError", "Database", "BlobStore",
+           "read_schema_version"]

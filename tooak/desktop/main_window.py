@@ -18,7 +18,8 @@
 * 把事件枝页里的**文件行拖到另一个方框** → 改这一行的环节（同一稿内，Ctrl+Z 可撤销）；
 * 时间轴右边的「＋ 新增一稿」→ 立刻建一稿空的并切过去，之后的文件都进这一稿；
 * 双击文件卡片 / 右键「看环节的年轮」→ 年轮视图；
-* 右键文件卡片「加入到这一稿…」→ 选文件后加进当前这一稿。
+* 右键文件卡片「添加文件到「方框」…」→ 选文件后加进**这一稿**的这个环节；
+* 右键文件卡片「加入到某一稿（复制一份）→」→ 把这一份**复制一份**登记进指定的那一稿。
 
 导航（照旧版 ToOak/Symphytum 的视图工具栏）
 ------------------------------------------
@@ -41,13 +42,15 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import queue
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QEvent, QPoint, QProcess, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QDate, QEvent, QPoint, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -73,7 +76,8 @@ from PySide6.QtWidgets import (
 from ..core import Library, LibraryError
 from ..version import VERSION, version_text
 from ..core.util import human_size
-from ..core.library import DOC_STATE_LABELS, ROLE_LABELS
+from ..core.library import (DOC_STATE_LABELS, ROLE_LABELS, normalize_new_name,
+                            same_file_name)
 from ..core.projectgraph import (DEFAULT_GROUP_H, DEFAULT_GROUP_W,
                                  DEPENDENCY_KIND, build_project_graph)
 from ..core.versiongraph import build_stage_graph, build_version_graph
@@ -96,7 +100,9 @@ from .style import (
     ACCENT as ACCENT_TEXT,
     DOC_STATE_COLORS,
     app_icon,
+    arrow_down_icon,
     arrow_left_icon,
+    arrow_up_icon,
     branch_pixmap,
     branch_plus_icon,
     chevron_left_icon,
@@ -406,6 +412,9 @@ class MainWindow(QMainWindow):
         self.view_stack.addWidget(self.board_view)
         self.view_stack.addWidget(self.event_page)
         self.view_stack.addWidget(self.graph_view)
+        # 离开白板时把它的镜头记下来（见 _on_view_stack_changed 的说明）
+        self._last_view_widget = self.view_stack.currentWidget()
+        self.view_stack.currentChanged.connect(self._on_view_stack_changed)
         center_layout.addWidget(self.view_stack, 1)
 
         # 画布**右上角**的缩放控件（Ctrl+滚轮缩放的"同一件事"，只是鼠标也能点）
@@ -500,8 +509,20 @@ class MainWindow(QMainWindow):
         self.action_import_files = self._make_toolbar_action(
             "导入文件…", self._import_files, import_icon(16),
             "把文件归档到当前事件枝；也可以直接把文件拖到事件枝页的方框里")
+        # 放在同一排按钮的最后两个（挨着"新建/导入"），作用于**选中的那棵项目树**。
+        self.action_project_up = self._make_toolbar_action(
+            "上移项目树", lambda: self.move_project(-1), arrow_up_icon(16),
+            "把选中的项目树往上挪一格（列表顺序会存进库里，下次打开还是这个顺序）\n"
+            "快捷键 Ctrl+↑")
+        self.action_project_down = self._make_toolbar_action(
+            "下移项目树", lambda: self.move_project(1), arrow_down_icon(16),
+            "把选中的项目树往下挪一格（列表顺序会存进库里，下次打开还是这个顺序）\n"
+            "快捷键 Ctrl+↓")
+        self.action_project_up.setShortcut(QKeySequence("Ctrl+Up"))
+        self.action_project_down.setShortcut(QKeySequence("Ctrl+Down"))
         self.sidebar.set_actions([self.action_new_project, self.action_new_event,
-                                  self.action_import_files])
+                                  self.action_import_files,
+                                  self.action_project_up, self.action_project_down])
 
         # 意义确实不大：界面在库被改动的地方都会自己重读一遍 ——
         # 归档/导入结束、撤销重做、目录监视回调、改名删除、换库…… 都直接调
@@ -665,7 +686,20 @@ class MainWindow(QMainWindow):
         self.sidebar.stateRequested.connect(self._set_event_state)
         self.sidebar.renameRequested.connect(self.rename_event)
         self.sidebar.deleteRequested.connect(self.delete_event)
+        self.sidebar.moveEventRequested.connect(self.move_event_to_project)
         self.sidebar.newEventRequested.connect(self._new_event_in_project)
+        # 整棵项目树：改名 / 删除（内核早就有，界面原来只有"新建"——建了删不掉的缺口）
+        self.sidebar.renameProjectRequested.connect(self.rename_project)
+        self.sidebar.deleteProjectRequested.connect(self.delete_project)
+        # 右键「上移 / 下移」与工具栏上那两个按钮走同一条路（先选中，再挪）
+        self.sidebar.moveProjectRequested.connect(self._move_project_from_menu)
+        # 右侧面板一致"）：折叠 / 改名 / 解散 / 选中成员 / 导出，都和白板上
+        # 那套是同一件事，走同一条路（同一份库记录、同一套确认）
+        self.sidebar.groupCollapseRequested.connect(self._set_group_collapsed)
+        self.sidebar.groupRenameRequested.connect(self._rename_board_group)
+        self.sidebar.groupDissolveRequested.connect(self._delete_board_group)
+        self.sidebar.groupSelectMembersRequested.connect(self._select_group_members)
+        self.sidebar.groupExportRequested.connect(self._export_board_group)
 
         # 项目树
         self.board_view.documentSelected.connect(self._on_board_document_selected)
@@ -676,6 +710,7 @@ class MainWindow(QMainWindow):
         self.board_view.noteChanged.connect(self._rename_board_note)
         self.board_view.noteMoved.connect(self._move_board_note)
         self.board_view.noteRemoveRequested.connect(self._delete_board_note)
+        self.board_view.noteAttachRequested.connect(self._attach_board_note)
         self.board_view.groupRequested.connect(self._create_board_group)
         self.board_view.groupRenameRequested.connect(self._rename_board_group)
         self.board_view.groupDeleteRequested.connect(self._delete_board_group)
@@ -693,6 +728,8 @@ class MainWindow(QMainWindow):
         self.board_view.cardLinkRequested.connect(self._open_card_link)
         self.board_view.cardRelinkRequested.connect(self._relink_card)
         self.board_view.groupRectChanged.connect(self._save_group_rect)
+        self.board_view.groupMoved.connect(self._save_group_position)
+        self.board_view.groupCollapseRequested.connect(self._set_group_collapsed)
         self.board_view.emptyGroupRequested.connect(self._create_empty_group)
         self.board_view.connectionRequested.connect(self._connect_events)
         self.board_view.edgeRemoveRequested.connect(self._disconnect_events)
@@ -701,12 +738,13 @@ class MainWindow(QMainWindow):
         self.board_view.stateRequested.connect(self._set_event_state)
         self.board_view.renameRequested.connect(self.rename_event)
         self.board_view.deleteRequested.connect(self.delete_event)
+        self.board_view.ackAlertRequested.connect(self.ack_dependency_alert)
+        self.board_view.restoreAlertRequested.connect(self.restore_dependency_alerts)
 
         # 事件枝页
         self.event_view.filesDropped.connect(self._on_stage_drop)
         # 文件行从一个方框拖到另一个方框 = 改这一行的环节（同一稿内，不新建稿）
         self.event_view.fileRoleChangeRequested.connect(self._move_file_role)
-        self.event_view.newVersionRequested.connect(self._add_new_version)
         self.event_view.stageFlowRequested.connect(self.open_stage_flow)
         self.event_view.rebindRequested.connect(self._rebind_version_files)
         self.event_view.statusMessage.connect(self.show_message)
@@ -732,6 +770,8 @@ class MainWindow(QMainWindow):
         # "正在看的是哪一稿、最新的是哪一稿"（两者常常不是同一稿）
         self.event_view.set_version_targets_provider(self.version_targets)
         self.event_view.fileRegisterRequested.connect(self._register_file_to_version)
+        # 文件行右键「改名…」：改库里记的名字（库内副本一并改），用户的原文件不碰
+        self.event_view.fileRenameRequested.connect(self._rename_file)
         # 信息框里直接改的东西（时间 / 相关人 / 进度 / 状态 / 说明）
         self.event_view.fieldChanged.connect(self._on_event_field_changed)
         # 方框自己排版：位置/大小按事件存库；"统一大小"记成默认值；「整理排版」清掉手工排版
@@ -742,6 +782,9 @@ class MainWindow(QMainWindow):
         self.timeline_panel.versionSelected.connect(self.show_event_version)
         self.timeline_panel.newVersionRequested.connect(self.add_event_version)
         self.timeline_panel.deleteRequested.connect(self.delete_event_version)
+        # 把画布上的一行文件拖到年轮里另一稿上 = 把这一份**复制一份进那一稿**
+        self.timeline_panel.fileRowDropped.connect(self._drop_file_row_on_draft)
+        self.timeline_panel.filesDropped.connect(self._drop_files_on_draft)
 
         # 年轮
         self.graph_view.versionSelected.connect(self._on_graph_version_selected)
@@ -1616,6 +1659,10 @@ class MainWindow(QMainWindow):
             ``setCurrentWidget(self.board_view)`` —— 在事件枝页按一下 Ctrl+Z
             就被踢回版图，"返回"历史里还被塞了一条假记录。
         """
+        # 上次用户离开的时候的放缩和位置"）。必须赶在 ``_project_id`` 和画布
+        # 内容被换掉之前：那之后画布上已经是新项目的图了，拍下来的就不是它自己的镜头。
+        if self._project_id and int(self._project_id) != int(project_id):
+            self._save_board_camera(self._project_id)
         if switch is None:
             switch = not keep_view
         if switch:
@@ -1630,11 +1677,59 @@ class MainWindow(QMainWindow):
         self._apply_board_header(project, graph)
         self._refresh_state_chip(None)
         if switch and not keep_view:
-            self.board_view.fit_to_content()
+            # 这个项目）才退回"全都看得见"
+            if not self._restore_board_camera(project_id):
+                self.board_view.fit_to_content()
         # 侧栏也要跟着选中这个项目（notify=False：别再绕回来一次）
         self.sidebar.select_project(project_id)
         self._update_nav()
         self._sync_zoom_control()
+
+    #: 白板的镜头（缩放 + 画面中心）**按项目**存在库里：`ui:board.camera.<项目 id>`
+    BOARD_CAMERA_KEY = "board.camera"
+
+    def _board_camera_key(self, project_id: int) -> str:
+        return f"{self.BOARD_CAMERA_KEY}.{int(project_id)}"
+
+    def _save_board_camera(self, project_id: int | None = None) -> None:
+        """
+
+        什么时候会调：切到别的项目 / 切到事件枝页或年轮 / 关窗口。
+        **按项目分开存**：每个项目的版图是各自摆的，公用一个镜头等于每次切过去
+        都落到别人家的位置。画布上一个图元都没有时什么都不存（那会儿
+        ``camera_state()`` 没有意义，存下去会把"适应窗口"这条退路也堵掉）。
+        """
+        project_id = int(project_id or self._project_id or 0)
+        if not project_id:
+            return
+        state = self.board_view.camera_state()
+        if not state:
+            return
+        try:
+            self.library.set_ui_option(self._board_camera_key(project_id), state)
+        except Exception:
+            # 关窗口那一路会走到这里：库连接可能已经在收尾了，
+            # "记不住镜头"远没有"关不干净"严重，静默放过
+            pass
+
+    def _restore_board_camera(self, project_id: int) -> bool:
+        """把上次离开这个项目时的镜头放回去；没存过（或存坏了）返回 False。"""
+        state = self.library.get_ui_option(self._board_camera_key(project_id), "")
+        if not state:
+            return False
+        return self.board_view.restore_camera_state(state)
+
+    def _on_view_stack_changed(self, _index: int) -> None:
+        """切走白板时把镜头记下来（离开事件枝页 / 年轮那两条路都经过这里）。
+
+        为什么用视图栈的信号而不是在每个 ``setCurrentWidget`` 旁边各写一句：
+        切视图的地方有十几处（面包屑、返回、上下一个事件枝、年轮…），
+        漏一处就变成"有时候记得住、有时候记不住"，那种 bug 最难查。
+        """
+        if self._last_view_widget is self.board_view \
+                and self.view_stack.currentWidget() is not self.board_view:
+            self._save_board_camera()
+        self._last_view_widget = self.view_stack.currentWidget()
 
     def _apply_board_header(self, project, graph) -> None:
         """版图上方那行标题 + 一句说明（拖动之后只更新它，不重建画布）。"""
@@ -1731,6 +1826,7 @@ class MainWindow(QMainWindow):
             "删除这一稿",
             f"确定删除 {document.title if document else ''} 的 v{version.seq} 吗？\n\n"
             f"这一稿登记了 {files} 个文件；删除后这一稿的记录会消失，\n"
+            "没人再引用时库里那份副本也跟着删掉；\n"
             "你磁盘上的原文件不动。事件至少要留一稿，最后一稿删不掉。",
         ):
             return
@@ -1889,11 +1985,11 @@ class MainWindow(QMainWindow):
             self._archive_paths(document.id, paths)
         self._join_group_at(document.id, x, y)
         self._refresh_board()
-        # 新建的卡片选中（选中的图元会自动提到最前，回到版图时一眼看到它）
+        # 新建的卡片**选中并滚到看得见**（``select_document`` 里已经 ensureVisible），
+        # 从白板上"种"下一根枝时人还在摆布局，跳走等于把他刚摆的图打断。
+        # 想进去看内容双击那张卡片就行。
         self.board_view.select_document(document.id)
-        # 并且直接进事件枝页 —— 这样立刻就能改名 / 拖文件进去，不用去列表里翻
         self.sidebar.rebuild()
-        self.open_event(document.id)
         self.sidebar.select_event(document.id, notify=False)
         self.undo_stack.push(
             f"新建事件枝「{title}」",
@@ -2307,7 +2403,13 @@ class MainWindow(QMainWindow):
         self.show_message("卡片已更新")
 
     def _delete_board_selection(self) -> None:
-        """按 Delete：说明框直接删、组问一句再解散、**事件不在这里删**。"""
+        """
+
+        以前这里只删说明框和分组，"选中的事件枝没动"—— 键按下去删不掉东西，
+        用户只会以为坏了。现在选中的事件枝**逐个确认后硬删**
+        （和右键「删除事件枝…」走同一个 `delete_event`：连年轮一起删、不能撤销、
+        磁盘上的原文件不动），多个一起时确认框会写清楚有几个。
+        """
         notes = [item.note.id for item in self.board_view._note_items.values()
                  if item.isSelected()]
         groups = [item.group.id for item in self.board_view._group_items.values()
@@ -2317,10 +2419,40 @@ class MainWindow(QMainWindow):
             self._delete_board_note(note_id)
         for group_id in groups:
             self._delete_board_group(group_id)
-        if events:
-            self.show_message(
-                f"选中的 {len(events)} 个事件枝没动 —— 删事件请右键卡片「删除事件…」"
-            )
+        self._delete_events(events)
+
+    def _delete_events(self, document_ids: list[int]) -> None:
+        """删掉若干个事件枝：**一次问清、逐条硬删**（Delete 键多选时走这里）。
+
+        规矩和单条那条完全一样（连年轮一起删、不能撤销、磁盘上的原文件不动），
+        只是多选时**只弹一次确认框**并把名字列出来 —— 选五个弹五次，用户点到第三次
+        就不知道自己删的是哪几个了。
+        """
+        titles = []
+        for document_id in document_ids:
+            document = self.library.get_document(document_id)
+            if document is not None:
+                titles.append((document_id, document.title))
+        if not titles:
+            return
+        if len(titles) == 1:
+            self.delete_event(titles[0][0])
+            return
+        lines = "".join(f"\n  · {title}" for _document_id, title in titles)
+        if not self._confirm(
+            "删除事件枝",
+            f"把这 {len(titles)} 个事件枝连同它们的年轮记录一起从库里删掉：{lines}\n\n"
+            "这一步不能撤销（Ctrl+Z 也回不来）。\n"
+            "你磁盘上的原始文件不会被删；库里那份副本跟着一起删掉。确定吗？",
+        ):
+            return
+        for document_id, _title in titles:
+            self.library.delete_document(document_id, hard=True)
+        self.sidebar.rebuild()
+        self._refresh_board()
+        for document_id, _title in titles:
+            self._leave_deleted_event(document_id)
+        self.show_message(f"已删除 {len(titles)} 个事件枝")
 
     def _on_board(self) -> bool:
         return self.view_stack.currentWidget() is self.board_view
@@ -2451,6 +2583,65 @@ class MainWindow(QMainWindow):
         except LibraryError as error:
             self.show_message(f"保存说明框位置失败：{error}")
 
+    def _attach_board_note(self, note_id: int, document_id: int) -> None:
+        """把一张白板卡片**吸附**到某个事件枝上（``document_id=0`` = 取消吸附）。
+
+        吸附之后这张便签跟着那张事件枝一起挪（见 ``project_view._follow_card``），
+        写它的那段话就不会在卡片搬家之后跟内容脱节。
+
+        吸附/松开都**记进撤销栈**：位置被挪了（贴到卡片旁边），
+        手滑吸错一张卡片时用户按 Ctrl+Z 就该回来。
+        """
+        row = self.library.get_board_card(note_id)
+        if row is None:
+            return
+        before = (row["x"], row["y"], int(row.get("attached_document_id") or 0))
+        # 那张事件枝卡片**实际有多高**：标题折行时它比默认的 CARD_H 高，
+        # 便签要贴在这张卡的正下方（不传这个数就会叠在卡片上）
+        target_item = self.board_view.item_for(document_id) if document_id else None
+        card_height = getattr(target_item, "card_h", None)
+        try:
+            self.library.attach_board_card(note_id, document_id or None,
+                                           card_height=card_height)
+        except LibraryError as error:
+            self.show_message(f"吸附失败：{error}")
+            return
+        after_card = self.library.get_board_card(note_id) or {}
+        after = (after_card.get("x", before[0]), after_card.get("y", before[1]),
+                 int(after_card.get("attached_document_id") or 0))
+        self._refresh_board()
+        if document_id:
+            document = self.library.get_document(document_id)
+            title = document.title if document else f"事件 {document_id}"
+            self.show_message(f"这张说明已吸附在「{title}」上（以后跟着它一起挪）")
+        else:
+            self.show_message("已取消吸附：这张说明现在自由摆放")
+        if after != before:
+            self.undo_stack.push(
+                "说明框吸附到事件枝" if document_id else "取消说明框吸附",
+                lambda: self._restore_card_attachment(note_id, before),
+                lambda: self._restore_card_attachment(note_id, after),
+            )
+
+    def _restore_card_attachment(self, note_id: int, state: tuple) -> None:
+        """把一张卡片的位置 + 吸附状态恢复成 ``state``（撤销/重做共用）。
+
+        位置**最后写**：``attach_board_card`` 在吸附时会把便签挪到卡片旁边
+        （那是它的正常行为），撤销要的是"回到当时那个坐标"，所以坐标得压在它后面。
+        取消吸附那一路走 ``attach_board_card(None)``：它只把那一列置空、不挪位置。
+        """
+        x, y, attached = state
+        try:
+            if attached:
+                self.library.update_board_card(note_id, attached_document_id=attached)
+            else:
+                self.library.attach_board_card(note_id, None)
+            self.library.update_board_card(note_id, x=x, y=y)
+        except LibraryError as error:
+            self.show_message(f"恢复说明框失败：{error}")
+            return
+        self._refresh_board()
+
     def _delete_board_note(self, note_id: int) -> None:
         """删掉一张卡片（说明框 / 素材卡）——**可撤销**。"""
         row = self.library.get_board_card(note_id)
@@ -2490,13 +2681,20 @@ class MainWindow(QMainWindow):
         if not name or not name.strip():
             return
         name = name.strip()
+        # 建组前先看一眼：这几个事件里本来就有归在别的组下的吗？有的话这一下
+        # 会把它们从那边移出来（一个事件只在一个分组下），得说一句
+        was_grouped = any(self.library.group_of_document(document_id)
+                          for document_id in ids)
         try:
             group_id = self.library.create_group(self._project_id, name, ids)
         except LibraryError as error:
             self.show_message(f"建组失败：{error}")
             return
         self._refresh_board()
-        self.show_message(f"已建组「{name}」（{len(ids)} 个事件枝）")
+        self._refresh_sidebar()
+        self.show_message(f"已建组「{name}」（{len(ids)} 个事件枝）"
+                          + ("；原来归在别的组里的已经移过来了（一个事件只在"
+                             "一个分组下）" if was_grouped else ""))
         # 进撤销栈：建组是拖动的副作用（拖进组框就会建），不进栈的话
         # 用户 Ctrl+Z 什么也撤不掉，只剩一个他并没要求过的组。
         # 写法照「新建空分组」那条：撤销 = 删组，重做 = 把组（含成员）恢复回来
@@ -2525,6 +2723,7 @@ class MainWindow(QMainWindow):
             self.show_message(f"建组失败：{error}")
             return
         self._refresh_board()
+        self._refresh_sidebar()      # 树里也要多出这个（空）分组节点
         self.show_message(f"建了一个空分组「{name.strip()}」—— 往里拖事件就会加入")
         row = next((item for item in self._board_groups() if item["id"] == group_id), None)
         if row is not None:
@@ -2552,6 +2751,7 @@ class MainWindow(QMainWindow):
             self.show_message(f"改组失败：{error}")
             return
         self._refresh_board()
+        self._refresh_sidebar()      # 树里那个节点上的名字也要跟着改
 
     def _delete_board_group(self, group_id: int) -> None:
         if not self._confirm(
@@ -2566,14 +2766,66 @@ class MainWindow(QMainWindow):
             self.show_message(f"解散失败：{error}")
             return
         self._refresh_board()
+        self._refresh_sidebar()      # 树里那个分组节点没了，成员回到项目下面
         self.show_message("已解散这个组（事件和文件都没动；Ctrl+Z 可以撤回来）")
         if row is not None:
             members = list(row.get("members") or [])
             self.undo_stack.push(
                 "解散分组",
-                lambda: (self.library.restore_group(row, members), self._refresh_board()),
-                lambda: (self.library.delete_group(group_id), self._refresh_board()),
+                lambda: (self.library.restore_group(row, members),
+                         self._refresh_board(), self._refresh_sidebar()),
+                lambda: (self.library.delete_group(group_id),
+                         self._refresh_board(), self._refresh_sidebar()),
             )
+
+    def ack_dependency_alert(self, document_id: int) -> None:
+        """「忽略本次依赖告警」：把这一枝现在挂着的依赖告警记成"我知道了"。
+
+        告警的判据是"上游出了比我这稿更新的稿"—— 有时候用户已经知道、甚至就是
+        特意先不动，那个琥珀色 ⚠ 一直挂着只会变成噪音。
+
+        **记住的是"忽略到哪一次为止"**：上游以后再出新稿，时间比这次记的更大，
+        告警会自己回来（这正是"本次"两个字的含义）。所以这里**写库**，重启后
+        依然算数；也进撤销栈（点错了 Ctrl+Z 就回来）。
+        """
+        document = self.library.get_document(document_id)
+        if document is None:
+            return
+        try:
+            acked = self.library.ack_dependency_alerts(document_id)
+        except LibraryError as error:
+            self.show_message(f"忽略告警失败：{error}")
+            return
+        if not acked:
+            self.show_message("这一枝现在没有依赖告警可忽略")
+            return
+        names = "、".join(f"「{row['dep_title']}」" for row in acked)
+        self._refresh_board()
+        self._refresh_sidebar()
+        self.show_message(f"已忽略{names}这次的依赖告警"
+                          "（上游再出新稿时会重新提醒）")
+        self.undo_stack.push(
+            "忽略依赖告警",
+            lambda: (self.library.clear_dependency_alerts(document_id),
+                     self._refresh_board(), self._refresh_sidebar()),
+            lambda: (self.library.ack_dependency_alerts(document_id),
+                     self._refresh_board(), self._refresh_sidebar()),
+        )
+
+    def restore_dependency_alerts(self, document_id: int) -> None:
+        """「恢复依赖告警」：把这一枝忽略过的告警重新显示出来。"""
+        acks = self.library.dependency_acks(document_id)
+        if not acks:
+            self.show_message("这一枝没有忽略过依赖告警")
+            return
+        try:
+            self.library.clear_dependency_alerts(document_id)
+        except LibraryError as error:
+            self.show_message(f"恢复告警失败：{error}")
+            return
+        self._refresh_board()
+        self._refresh_sidebar()
+        self.show_message("已恢复依赖告警")
 
     def _save_group_rect(self, group_id: int, x: float, y: float,
                          w: float, h: float) -> None:
@@ -2585,6 +2837,43 @@ class MainWindow(QMainWindow):
             return
         self.show_message("分组框大小已记下（不再自动跟着成员收紧）")
 
+    def _save_group_position(self, group_id: int, x: float, y: float) -> None:
+        """拖动**折起来**的分组：只存位置（大小还是"摊开时"的那个）。
+
+        为什么不用 ``_save_group_rect``：折叠时那一条标题栏的高度就是标题栏，
+        照它写库等于把这一组的大小压扁，摊开回来只剩一条；而且那一路还会
+        把组标成"手工尺寸"，从此不再跟着成员收紧。
+        """
+        try:
+            self.library.set_group_position(group_id, x, y)
+        except LibraryError as error:
+            self.show_message(f"保存分组位置失败：{error}")
+
+    def _set_group_collapsed(self, group_id: int, collapsed: bool) -> None:
+        """
+
+        """
+        try:
+            self.library.set_group_collapsed(group_id, collapsed)
+        except LibraryError as error:
+            self.show_message(f"折叠分组失败：{error}")
+            return
+        self._refresh_board()
+        # 展开状态，不重建整棵树 —— 折叠是"看一眼的方式"，重建会把用户滚到的
+        # 位置抖一下。从哪边按的都一样，因为两边共用库里的 collapsed。
+        self.sidebar.set_group_collapsed(group_id, collapsed)
+        title = ""
+        for item in self._board_groups():
+            if item["id"] == group_id:
+                title = str(item.get("name") or "")
+                break
+        name = f"「{title}」" if title else "这一组"
+        self.show_message(
+            f"已把{name}折起来（只剩标题栏那一条，成员位置一个都没改）"
+            if collapsed else
+            f"已把{name}摊开（成员回到原来摆的位置）"
+        )
+
     def _set_group_membership(self, group_id: int, document_ids, add: bool) -> None:
         ids = [int(item) for item in (document_ids or [])]
         if not ids:
@@ -2595,9 +2884,10 @@ class MainWindow(QMainWindow):
                         if item["id"] == group_id), {})
         before_members = {int(item) for item in (current.get("members") or [])}
         was_empty = not before_members
+        moved: list[dict] = []
         try:
             if add:
-                self.library.add_group_members(group_id, ids)
+                moved = self.library.add_group_members(group_id, ids) or []
             else:
                 self.library.remove_group_members(group_id, ids)
         except LibraryError as error:
@@ -2609,7 +2899,24 @@ class MainWindow(QMainWindow):
             x, y, w, h = rect
             self.library.set_group_rect(group_id, x, y, w, h, manual=False)
         self._refresh_board()
-        self.show_message(("已加入组" if add else "已移出组") + f"（{len(ids)} 个事件枝）")
+        # 左边那棵树里"事件挂在哪个组下面"跟着变了（一个事件只能在一个组下），
+        # 所以要重画（rebuild 会保住当前选中与滚动到的位置）
+        self._refresh_sidebar()
+        # 从别的组挪过来时要说清楚：用户看不到这句话，只会发现"加进乙组了，
+        # 可甲组里怎么没了"
+        if moved:
+            names = []
+            for entry in moved:
+                label = entry.get("name") or "未命名组"
+                if label not in names:
+                    names.append(label)
+            self.show_message(
+                f"已加进这个组（{len(ids)} 个事件枝）；"
+                f"原来在「{'」「'.join(names)}」里的已从那边移出来"
+                "（一个事件只在一个分组下）"
+            )
+        else:
+            self.show_message(("已加入组" if add else "已移出组") + f"（{len(ids)} 个事件枝）")
         if {int(item) for item in remaining} == before_members:
             # 成员一个都没变（比如把已在组里的事件又"加入"一次）：不进撤销栈 ——
             # 一条撤了看不出任何变化的记录只会碍事
@@ -2634,6 +2941,37 @@ class MainWindow(QMainWindow):
             self.show_message(f"改分组失败：{error}")
             return
         self._refresh_board()
+        self._refresh_sidebar()
+
+    def _refresh_sidebar(self) -> None:
+        """重画左边那棵树（**保住当前选中与展开状态**，见 ``rebuild``）。
+
+        分组的增删改名、成员进出，都会改"哪个事件挂在哪个组下面"——
+        """
+        try:
+            self.sidebar.rebuild()
+        except RuntimeError:                   # pragma: no cover - 关窗口途中的残留
+            pass
+
+    def _select_group_members(self, group_id: int) -> None:
+        """树里右键分组行「选中组里的事件枝」：切到版图，把这几个事件枝选上。"""
+        group = next((item for item in self._board_groups() if item["id"] == group_id),
+                     None)
+        if group is None:
+            return
+        if self._project_id:
+            self.show_project_board(self._project_id, keep_view=True, switch=True)
+        view = self.board_view
+        view._scene.clearSelection()
+        picked = 0
+        for document_id in group.get("members") or []:
+            item = view.item_for(document_id)
+            if item is not None:
+                item.setSelected(True)
+                picked += 1
+        self.show_message(
+            f"已在版图上选中「{group.get('name') or '未命名组'}」里的 {picked} 个事件枝"
+        )
 
     def _set_edge_curve(self, from_id: int, to_id: int, curve: float) -> None:
         """调一条连线的弯曲度（存库 + 立刻重画）。"""
@@ -3048,6 +3386,10 @@ class MainWindow(QMainWindow):
         if self._shutting_down:
             return
         self.sidebar.set_filter(text)
+        # 高亮处理，体现在左右的界面上"）：左边那棵树是筛出来 + 标出来，
+        # 右边白板的卡片标题、事件枝页的文件名把命中的那几段标出来
+        self.board_view.set_search(text)
+        self.event_view.set_search(text)
 
     def _focus_first_hit(self) -> None:
         event_id = self.sidebar.first_match()
@@ -3186,22 +3528,6 @@ class MainWindow(QMainWindow):
             self._run_archive(document_id=document_id, paths=[chosen[0]],
                               stage_role=role, stage_replace=True,
                               target_version_id=target_version_id)
-            return
-        self._run_archive(document_id=document_id, paths=list(paths), stage_role=role,
-                          target_version_id=target_version_id)
-
-    def _add_new_version(self, document_id: int, role: str, version_id: int) -> None:
-        """某个文件卡片上右键「加入到这一稿…」：选文件后加进**当前这一稿**。
-
-        ``version_id`` 是那行文件自己所属的稿（未登记的文件卡片上它可能是更早的稿），
-        这里**不用它**：右键的语义是"往我现在看的这一稿里加"，落在哪一稿由
-        ``_draft_for_files`` 说了算 —— 老代码拿它去建新稿，正是"拖个文件就多一稿"的来源。
-        """
-        target_version_id, allowed = self._draft_for_files(document_id)
-        if not allowed:
-            return
-        paths = self._ask_files("选择要加进这一稿的文件")
-        if not paths:
             return
         self._run_archive(document_id=document_id, paths=list(paths), stage_role=role,
                           target_version_id=target_version_id)
@@ -3584,16 +3910,153 @@ class MainWindow(QMainWindow):
             info["shown"] = {"id": shown.id, "seq": shown.seq}
         if latest is not None:
             info["latest"] = {"id": latest.id, "seq": latest.seq}
+        # 全部稿号（供「加入到某一稿（复制一份）→」子菜单列表用）：
+        # **从旧到新**排（稿号顺序跟年轮一致），并标出"就是现在看的这一稿"。
+        # 附带的说明用这一稿自己的文字：有说明写说明，没有就写主文件名
+        # （``Version`` 上没有 ``display_name`` —— 一开始写它，AttributeError 被
+        #  ``version_targets()`` 吞掉，两个菜单一起消失，测试抓到了）。
+        info["drafts"] = [
+            {"id": version.id, "seq": version.seq,
+             "label": version.note or version.source_name or "",
+             "is_current": version.id == (shown.id if shown else -1)}
+            for version in self.library.version_history(document_id)
+        ]
         return info
+
+    def _drop_file_row_on_draft(self, target_version_id: int, source_version_id: int,
+                                file_id: int) -> None:
+        """把画布上的一行文件**拖到年轮里某一稿上** = 把这一份复制一份进那一稿。
+
+
+        和右键那条「加入到某一稿（复制一份）→」是**同一件事**（内核同一个方法、
+        同一份真复制、同样不新建稿不动当前稿），区别只在入口：拖过去更快，
+        所以这里**不弹那个"确认 + 改名"的框**（拖一下弹一个框就不叫快了），
+
+        * 内核遇到重名是**不登记**（返回 ``added=False``），界面上表现成
+          "拖过去了，什么都没发生"，用户只会以为拖放坏了；
+        * 所以这里先查一次，问"要不要换个名字放进去"，要就让他填个名字、
+          不要就什么都不做（并如实说一句）。
+        """
+        source = self.library.get_version(source_version_id)
+        target = self.library.get_version(target_version_id)
+        if source is None or target is None:
+            return
+        item = next((row for row in source.files if row.id == file_id), None)
+        if item is None:
+            return
+        if source.id == target.id:
+            self.show_message(
+                f"「{item.name}」本来就登记在 v{target.seq} 里，不用再放一次"
+            )
+            return
+        new_name = self._name_for_the_copy(target, item)
+        if new_name is False:
+            return                       # 用户选了"算了"
+        job = FileCopyJob(self.library_root, source_version_id, file_id,
+                          target_version_id, new_name=new_name)
+        self._copy_jobs[job.id] = job
+        job.start()
+        self.show_message(
+            f"正在把「{item.name}」复制一份到 v{target.seq}…（后台进行，可以继续用）"
+        )
+
+    def _name_for_the_copy(self, target, item) -> str | None | bool:
+        """重名了就问一句：返回**要用的名字**、``None``（照原名字放）、或 ``False``（算了）。
+
+        三条出口对应三种情况：
+
+        * 目标稿里没有同名的 → ``None``（照原名字复制过去，一路无话）；
+        * 有同名的 → 先说清"它在哪个环节"，再问要不要换名字；用户点"算了"
+          返回 ``False``（一个字都不动），点"换名字"就让 ``_ask_text`` 填一个
+          **新的唯一名字**当建议值（``报告-2.docx`` 这种）；
+        * 自动化（``interactive=False``）下没人回答那些框，与 ``_confirm``
+          自动通过同一条规矩：**照原名字往前走**（内核会拦住重复登记并如实报出来）。
+        """
+        copy_name = normalize_new_name(None, fallback=item.name)
+        existing = next((row for row in target.files
+                         if same_file_name(row.name, copy_name)), None)
+        if existing is None or not self.interactive:
+            return None
+        role_label = ROLE_LABELS.get(existing.role, existing.role)
+        if not self._confirm(
+            f"v{target.seq} 里已经有「{existing.name}」了",
+            f"它登记在「{role_label}」里。\n\n"
+            f"再放一份同名的进去没法区分点哪个，所以库里不让重名。\n"
+            f"给这一份**换个名字**再放进 v{target.seq} 吗？\n"
+            "（点「确定」会让你填新名字；点「取消」就什么都不做）",
+        ):
+            self.show_message(
+                f"没有放进去：v{target.seq} 里已经有一份「{existing.name}」"
+                f"（{role_label}）"
+            )
+            return False
+        return self._ask_text(
+            "给这一份换个名字",
+            f"这一份放进 v{target.seq} 之后叫什么？（不能和已有的重名）\n\n"
+            "只是库里这一份的名字；你磁盘上的原文件一个字都不动。\n"
+            "扩展名不写就沿用原来的：",
+            self._free_name_in(target, copy_name),
+        )
+
+    @staticmethod
+    def _free_name_in(version, name: str) -> str:
+        """在 ``version`` 这一稿里给 ``name`` 找一个**不重名**的名字当建议值。
+
+        规则很直白：``报告.docx`` → ``报告-2.docx`` → ``报告-3.docx``…
+        只是个预填值（用户可以改成别的），所以不必比内核那套判定更聪明。
+        """
+        taken = {row.name.casefold() for row in version.files}
+        if str(name).casefold() not in taken:
+            return str(name)
+        path = Path(str(name))
+        stem, suffix = path.stem, path.suffix
+        for index in range(2, 100):
+            candidate = f"{stem}-{index}{suffix}"
+            if candidate.casefold() not in taken:
+                return candidate
+        return str(name)
+
+    def _drop_files_on_draft(self, target_version_id: int, paths) -> None:
+        """从文件管理器把真文件**拖到年轮里某一稿上** = 把这几份加进那一稿。
+
+        与"拖进环节方框"是同一条语义（``add_files_to_version``）：不新建稿、
+        只动这一稿；同名文件这一稿里原来那行会被顶掉 —— 所以**这一稿里已经有
+        悄悄发生。
+        """
+        target = self.library.get_version(target_version_id)
+        if target is None:
+            return
+        wanted = [Path(path) for path in (paths or []) if Path(path).is_file()]
+        if not wanted:
+            return
+        existing = {row.name.casefold(): row for row in target.files}
+        clashes = [path.name for path in wanted if path.name.casefold() in existing]
+        if clashes and self.interactive:
+            shown = "、".join(f"「{name}」" for name in clashes[:5])
+            if not self._confirm(
+                f"v{target.seq} 里已经有同名文件",
+                f"{shown} 在 v{target.seq} 里已经登记过了。\n\n"
+                "继续的话，这一稿里那几行会换成你现在拖进来的这份文件"
+                "（原来那行不再登记在这一稿里，历史稿一个字不动）。\n"
+                "要这样放进去吗？",
+            ):
+                return
+        self._run_archive(document_id=target.document_id, paths=[str(p) for p in wanted],
+                          target_version_id=target_version_id)
+        self.show_message(
+            f"正在把 {len(wanted)} 个文件加进 v{target.seq}…（后台进行，可以继续用）"
+        )
 
     def _register_file_to_version(self, source_version_id: int, file_id: int,
                                   target_version_id: int) -> None:
         """右键「复制一份到这一稿 / 到最新稿」：把这份文件**真的复制一份**登记进目标稿。
 
-        三件事必须说清（都在这段里）：
+        四件事必须说清（都在这段里）：
 
           "我可能是把 V1 提到 V2，而 V3 又有文件了"），绝不自己猜"最新稿"；
           而不是仅仅复制链接"）—— 确认框里把大小写出来，别让人以为不占地方；
+        * **顺便能改名**：确认框里那个输入框预填原文件名，改了就按新名字存
+          名字留空就等于不改；扩展名不写会自动沿用原来的；
         * 复制 + 算指纹可能是几十秒（GB 级图纸），所以**丢给后台任务**
           （``FileCopyJob``），界面不卡。
         """
@@ -3605,20 +4068,84 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         role_label = ROLE_LABELS.get(item.role, item.role)
-        if not self._confirm(
-            "复制一份到这一稿",
-            f"把「{item.name}」复制一份到 v{target.seq} 的「{role_label}」吗？\n\n"
-            f"它在库里会**多出一份实体文件**（{human_size(item.size)}，"
-            "放在库的 files/ 下，与原来那一份各管各的）；\n"
-            f"不新建稿，你磁盘上的原文件一个字节都不动。",
-        ):
-            return
+        # **确认 + 改名一次问完**（``_ask_text`` 本身就是个带输入框的框）：用户
+        # "弹窗让用户确认的时候也给出文件名框让用户可以编辑修改名字"。留空 = 不改名。
+        # 自动化（interactive=False）下没有"回答"这回事：照旧拿原文件名往前走
+        # （与 ``_confirm`` 在自动化下自动通过同一条规矩）—— 但**绝不凭空替用户改名**。
+        if not self.interactive:
+            new_name: str | None = item.name
+        else:
+            new_name = self._ask_text(
+                "复制一份到这一稿",
+                f"把「{item.name}」复制一份到 v{target.seq} 的「{role_label}」。\n\n"
+                f"它在库里会多出一份实体文件（{human_size(item.size)}，放在库的 files/ 下，"
+                "与原来那一份各管各的）；\n"
+                "不新建稿，你磁盘上的原文件一个字节都不动。\n\n"
+                "这一份在库里叫什么名字（可以改；扩展名不写就沿用原来的）：",
+                item.name,
+            )
+        if new_name is None:
+            return                       # 用户点了取消：什么都不做
         job = FileCopyJob(self.library_root, source_version_id, file_id,
-                          target_version_id)
+                          target_version_id, new_name=new_name)
         self._copy_jobs[job.id] = job
         job.start()
         self.show_message(
             f"正在把「{item.name}」复制一份到 v{target.seq}…（后台进行，可以继续用）"
+        )
+
+    def _rename_file(self, version_id: int, file_id: int) -> None:
+        """
+
+        与"复制一份到这一稿"合起来的用法很自然：先把文件登记到某一稿、
+        顺手把名字改成这一期该叫的名字，而不是"删掉再拖一次"。
+
+        三条纪律（内核 ``Library.rename_file`` 里也写着，界面这边保证不越界）：
+
+        * **只改库里记的名字**。引用模式下用户自己磁盘上的那个文件原名一个字不动；
+          复制进库的那一份（库自己的文件）会把 ``files/<别名>/`` 里的实体文件
+          一起改名，这样"打开所在文件夹"看到的才对得上。
+        * **只改这一稿这一行**。右键"未登记"那种行时改的是它**所属的更早那一稿**
+          记的名字，所以上面菜单里已经写明稿号，这里的提示语也跟着写明。
+        * **改名很快，就在界面线程做**（一条 UPDATE + 一次同目录改名，不读内容、
+          不算指纹），不像归档/复制那样几十秒 —— 无需后台任务；
+          但**失败必须说出来**：库里那份文件正被 Word 打开着时改名会失败，
+          静默吞掉的话用户会以为改好了。
+        """
+        version = self.library.get_version(version_id)
+        if version is None:
+            return
+        item = next((row for row in version.files if row.id == file_id), None)
+        if item is None:
+            return
+        new_name = self._ask_text(
+            "给文件改名",
+            f"「{item.name}」在 v{version.seq} 的「{ROLE_LABELS.get(item.role, item.role)}」里"
+            "叫什么名字？\n\n"
+            "改的是**库里记的名字**（这一稿的文件清单、导出、Word 比较都跟着变）；\n"
+            "你磁盘上的原文件不动；复制进库的那一份会把库内文件一起改名。\n"
+            "扩展名不写就沿用原来的。",
+            item.name,
+        )
+        if new_name is None:
+            return                       # 取消 / 自动化环境：什么都不做
+        try:
+            result = self.library.rename_file(version_id, file_id, new_name)
+        except LibraryError as error:
+            self._notify("改名失败", str(error))
+            self.show_message(f"改名失败：{error}")
+            return
+        if result.get("name") == result.get("old_name"):
+            self.show_message(f"名字没变（还是「{item.name}」），什么都没做")
+            return
+        # **先刷新画布、再写状态栏**（同 ``_on_file_copy_finished``）：刷新会重建
+        # 事件枝页，重建前那句"把没提交的说明框落库"会往状态栏写一句"已保存"，
+        # 顺序反了用户就看不到"已改名为 …"。
+        self._refresh_current_view()
+        self._after_write(
+            f"已把 v{version.seq} 里那份「{result.get('old_name')}」改名为"
+            f"「{result.get('name')}」"
+            + ("（库内那份实体文件一并改名）" if result.get("renamed_copy") else "")
         )
 
     def _on_file_copy_finished(self, event: FileCopyFinished) -> None:
@@ -3667,25 +4194,30 @@ class MainWindow(QMainWindow):
         self.show_message("正在用 Word 比较…（要启动 Word，第一次可能要十几秒）")
 
     def _on_word_compare_finished(self, event: WordCompareFinished) -> None:
-        """Word 比完了：成功就把结果摆到用户面前，失败就如实说清为什么。
+        """比较完了：成功就把结果摆到用户面前，失败就如实说清为什么。
 
-        **成功不弹模态框**：Word 已经被留在前台显示那份带修订的文档了，
+        **成功不弹模态框**：程序已经被留在前台显示那份带修订的文档了，
         再弹一个"完成"框等于让用户多关一次窗。失败必须弹 ——
         那时候界面上什么都没发生，只写状态栏等于没说。
+
+        提示语里的名字用**这次真正干活的那个程序**（``event.engine``）：
+        装过 WPS 的机器上 ``Word.Application`` 很可能是 WPS 顶着的，
+        写"Word 比较完成"会让用户以为开错了程序。
         """
         if not event.ok:
             reason = event.error or "原因不明"
-            self._notify("用 Word 比较失败", reason)
+            self._notify("用 Word / WPS 比较失败", reason)
             # 状态栏也留着原因：真实用户扫一眼状态栏就该知道为什么没比成，
             # 而提示框关掉之后状态栏是唯一还留在那儿的线索。
             self.show_message(
-                f"用 Word 比较失败：{reason}"
+                f"用 Word / WPS 比较失败：{reason}"
                 + (f"（{event.labels}）" if event.labels else "")
             )
             return
         where = event.labels or ""
+        who = event.engine or "Word"
         self.show_message(
-            f"Word 比较完成：{event.message}"
+            f"{who} 比较完成：{event.message}"
             + (f"（{where}）" if where else "")
             + f" · 结果：{event.output}"
         )
@@ -4069,7 +4601,7 @@ class MainWindow(QMainWindow):
             "删除事件枝",
             f"把「{document.title}」连同它的年轮记录一起从库里删掉。\n"
             "这一步不能撤销（Ctrl+Z 也回不来）。\n\n"
-            "你磁盘上的原始文件不会被删。确定吗？",
+            "你磁盘上的原始文件不会被删；库里那份副本跟着一起删掉。确定吗？",
         ):
             return
         self.library.delete_document(document_id, hard=True)
@@ -4093,6 +4625,168 @@ class MainWindow(QMainWindow):
         self._stage_role = None
         if self._project_id:
             self.show_project_board(self._project_id)
+
+    def _move_project_from_menu(self, project_id: int, offset: int) -> None:
+        """右键菜单点「上移 / 下移」：先把它选中，再走同一条排序路。"""
+        self.sidebar.select_project(project_id, force=True)
+        self._project_id = project_id
+        self.move_project(offset)
+
+    def move_project(self, offset: int) -> None:
+        """把选中的项目树往上/往下挪一格（侧栏工具栏的上移 / 下移按钮，参数 = ∓1）。
+
+        顺序落库（``projects.position``），下次打开还是这个顺序；
+        已经在头/尾时**如实说一句**，而不是点了没反应。
+        """
+        project_id = self._project_id or self.sidebar.current_project_id()
+        if not project_id:
+            self.show_message("先在上面的列表里选中一棵项目树，再点上移 / 下移")
+            return
+        project = self.library.get_project(project_id)
+        if project is None:
+            return
+        try:
+            moved = self.library.move_project(project_id, offset)
+        except LibraryError as error:
+            self._notify("排序失败", str(error))
+            return
+        if not moved:
+            self.show_message(f"「{project.name}」已经在{'最上面' if offset < 0 else '最下面'}了")
+            return
+        name = project.name
+        self.sidebar.rebuild()
+        self.sidebar.select_project(project_id, force=True)
+        self.show_message(f"已把「{name}」{'上移' if offset < 0 else '下移'}一格")
+
+    def rename_project(self, project_id: int) -> None:
+        """给项目树改名（侧栏项目树行右键 / 选中项目行按 F2）。
+
+        内核一直有 ``update_project``，但界面上没有任何入口 —— 名字打错一个字的树
+        只能删了重建（而"删"原来也没有），是个不闭环的缺口。规矩与改事件名一致：
+        空名字/没变就当没发生，改完刷新侧栏与看板标题。
+        """
+        project = self.library.get_project(project_id)
+        if project is None:
+            return
+        new_name = self._ask_text("修改项目树名称", "新名称：", project.name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == project.name:
+            return
+        try:
+            self.library.update_project(project_id, name=new_name)
+        except LibraryError as error:
+            self._notify("改名失败", str(error))
+            return
+        self.sidebar.rebuild()
+        self._after_write(f"已改名为「{new_name}」")
+        if self._project_id == project_id:
+            if self._document_id:
+                self.open_event(self._document_id, self._version_id)
+            else:
+                self.show_project_board(project_id, keep_view=True)
+
+    def delete_project(self, project_id: int) -> None:
+        """删除**整棵项目树**（侧栏项目树行右键 / 选中项目行按 Delete）。
+
+        ``ON DELETE CASCADE``：节点 → 事件 → 年轮 → 文件行一起走），界面上却只有
+        "新建项目树" —— 建出来的树删不掉，是个不闭环的缺口。
+
+        三条纪律（与删事件枝同一条路子）：
+
+          "不能撤销"，而不是让人以为 Ctrl+Z 能回来（老文档里那句"先归档，
+          可 Ctrl+Z 找回"是**错的**，已经改掉）；
+        * **确认框写清代价**：这棵树下面有几个事件枝、多少稿，一起说清楚 ——
+          删一棵树比删一个事件枝重得多，不能只问一句"确定吗"；
+        * **磁盘上的原始文件一个都不动**；库里那份**副本立刻就删**（
+          ``delete_project`` 里接的就是 gc）—— 以前这里写的是"等体检时回收"，
+          那是句糊涂话：既让人以为要先跑一条命令行（``tooak gc``），
+          又与代码实际做的事对不上（用户一眼就看出来了）。
+        """
+        project = self.library.get_project(project_id)
+        if project is None:
+            return
+        # 数一下这棵树下面有多少个事件枝、多少稿：删一棵树比删一个事件枝重得多，
+        # 确认框里得把代价写清楚（``list_events`` 是"活动记录"那张表，别拿它数事件）
+        events = [document
+                  for node in self.library.node_tree(project_id)
+                  for document in self.library.list_documents(node.id,
+                                                              include_descendants=True)]
+        versions = sum(len(self.library.version_history(document.id))
+                       for document in events)
+        if not self._confirm(
+            "删除项目树",
+            f"把「{project.name}」连同它下面的 {len(events)} 个事件枝、"
+            f"{versions} 稿年轮记录一起从库里删掉。\n"
+            "这一步不能撤销（Ctrl+Z 也回不来）。\n\n"
+            "你磁盘上的原始文件一个都不会删；库里那份副本跟着一起删掉。确定吗？",
+        ):
+            return
+        try:
+            self.library.delete_project(project_id)
+        except LibraryError as error:
+            self._notify("删除失败", str(error))
+            return
+        # 这个项目白板的镜头也一起清掉：树都没了，那条 `ui:board.camera.<id>`
+        # 只会留在库里占地方；更要紧的是**新库不会有这个 id 的项目**，
+        # 万一以后 id 被复用，一进去就落到一个莫名其妙的镜头上
+        self.library.set_ui_option(self._board_camera_key(project_id), "")
+        self.sidebar.rebuild()
+        if self._project_id == project_id:
+            # 删掉的正是当前这棵树：不能停在一个已经不存在的版图上
+            self._project_id = None
+            self._document_id = None
+            self._version_id = None
+            self._stage_role = None
+            self._auto_select_first()
+        self.show_message(f"已删除项目树「{project.name}」"
+                          f"（连同 {len(events)} 个事件枝）")
+        self._update_status()
+
+    def move_event_to_project(self, document_id: int) -> None:
+        """把一根事件枝移到**别的项目树**下（侧栏事件枝行右键）。
+
+        内核一直有 ``move_document``，但界面和 CLI 都没有入口 —— 归类分错了的枝
+        只能删掉重建，而重建就把年轮记录丢了。这里补上入口：问一句移到哪棵树，
+        然后挂到那棵树的根节点下（和"新建事件枝"落的地方一致）。
+
+        目标树里已经有同名的事件枝时**直说不行**（内核会拦），不硬挤进去 ——
+        一可树里两根同名枝，用户分不清点哪个。
+        """
+        document = self.library.get_document(document_id)
+        if document is None:
+            return
+        node = self.library.get_node(document.node_id)
+        current_project = node.project_id if node else None
+        others = [project for project in self.library.list_projects()
+                  if project.id != current_project]
+        if not others:
+            self.show_message("只有一个项目树，没有别的地方可移")
+            return
+        if not self.interactive:
+            return
+        labels = [project.name for project in others]
+        choice, accepted = QInputDialog.getItem(
+            self, "移到别的项目树",
+            f"把「{document.title}」移到哪棵项目树下？", labels, 0, False,
+        )
+        if not accepted or choice not in labels:
+            return
+        target = others[labels.index(choice)]
+        try:
+            root = self.library.node_tree(target.id)[0]
+            self.library.move_document(document_id, root.id)
+        except LibraryError as error:
+            self._notify("移动失败", str(error))
+            return
+        self.sidebar.rebuild()
+        if self._document_id == document_id:
+            # 跟着它过去：不然停在一个"已经不在这棵树里"的事件枝页上
+            self.open_event(document_id, self._version_id)
+        elif self._project_id:
+            self.show_project_board(self._project_id, keep_view=True)
+        self._after_write(f"已把「{document.title}」移到「{target.name}」")
 
     def _ask_text(self, title: str, label: str, default: str = "") -> str | None:
         """要用户输入一行文字（interactive=False 时直接返回 None，自动化不弹框）。"""
@@ -4266,14 +4960,19 @@ class MainWindow(QMainWindow):
             self._notify("说明文件缺失", f"没找到 {path}")
 
     def _open_library_dialog(self) -> None:
-        """「打开库…」：选一个库目录，记住它，然后重启进程指向那个库。
+        """「打开库…」：选一个库目录，记住它，然后**重启进程**指向那个库。
 
         为什么用"重启"而不是就地热切换：库换了之后，侧栏 / 白板 / 事件枝页 /
         年轮 / 撤销栈 / 会话恢复全都要重建，就地切一遍的坑比重启大得多；
-        重启由 run.py 从新目录重读，是唯一确定干净的路径。
+        重启由新进程从新目录重读，是唯一确定干净的路径。
 
         选中的目录里**还没有库**（没有 tooak.sqlite3）时，问一句要不要在这里
         新建一个 —— 这样"新建库"和"换库"走同一条路，首启引导只是它的一个变体。
+
+        旧窗口一关，桌面上就什么都没有了，用户只会以为程序崩了。所以这里
+        * 先起新进程、**看它到底起没起来**（``Popen`` 会抛 ``OSError``），
+        * 起来了才写"上次用的库"并退出；
+        * 没起来就把要手敲的命令显示出来，窗口留着 —— 至少用户知道发生了什么。
         """
         folder = QFileDialog.getExistingDirectory(
             self, "选择库所在目录", str(self.library_root)
@@ -4288,16 +4987,58 @@ class MainWindow(QMainWindow):
                 "要在这里新建一个吗？",
             ):
                 return
+        command, cwd = self._restart_command(root)
+        try:
+            self._spawn_detached(command, cwd)
+        except OSError as error:
+            self._notify(
+                "没能自动重启",
+                f"新实例没起来：{error}\n\n"
+                "这个库的位置已经记下了，手动重开一次 ToOak 就是它：\n"
+                + " ".join(str(part) for part in command),
+            )
+            return
         write_last_library(root)
-        if getattr(sys, "frozen", False):
-            # 打包成 exe 后没有 run.py，直接重启自己（exe）指向新库
-            QProcess.startDetached(sys.executable, ["-L", str(root)])
-        else:
-            run_py = Path(__file__).resolve().parents[2] / "run.py"
-            # 用 QProcess 在后台拉起新实例，再退出当前窗口 —— 新实例不受
-            # tooak.sh 的单实例 flock 限制（那是 shell 层的锁，这里直接跑 run.py）
-            QProcess.startDetached(sys.executable, [str(run_py), "-L", str(root)])
         QApplication.instance().quit()
+
+    @staticmethod
+    def _restart_command(root: Path) -> tuple[list[str], Path]:
+        """重启要用哪条命令、在哪个目录下跑。
+
+        * 打包成 exe：直接重新拉起自己（``sys.executable`` 就是 ToOak.exe）；
+        * 从源码跑：用当前解释器跑 ``run.py``。**工作目录取仓库根**，
+          免得从别处（快捷方式、另一块盘）启动时 ``run.py`` 里的相对路径对不上。
+        """
+        interpreter = Path(sys.executable)
+        if getattr(sys, "frozen", False):
+            return [str(interpreter), "-L", str(root)], interpreter.parent
+        repo = Path(__file__).resolve().parents[2]
+        return [str(interpreter), str(repo / "run.py"), "-L", str(root)], repo
+
+    @staticmethod
+    def _spawn_detached(command: list[str], cwd: Path) -> None:
+        """把新实例拉起来，**不留黑框、也不跟着旧进程一起死**。
+
+        两个 Windows 细节：
+        * ``CREATE_NO_WINDOW``：从源码跑时 ``python.exe`` 是控制台程序，
+        * ``DETACHED_PROCESS`` / ``CREATE_NEW_PROCESS_GROUP``：新实例要能在
+          旧进程退出之后继续活着，也不要和旧进程共用控制台。
+        不用 ``QProcess.startDetached`` 的原因：它不接 ``creationflags``，
+        而且**失败了也没有异常**（返回 False），正是"关了窗口却什么都没起来"
+        那条路的来源。
+
+        :raises OSError: 起不来（路径不对 / 没权限 / 被杀软拦下）。
+        """
+        flags = 0
+        if os.name == "nt":
+            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        subprocess.Popen(                       # noqa: S603 - 命令是自己拼的，没有外部输入
+            command, cwd=str(cwd), creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+        )
 
     # ------------------------------------------------------------- 旧库导入
 
@@ -4467,6 +5208,11 @@ class MainWindow(QMainWindow):
         self._shutting_down = True
         if getattr(self, "_layout_save_timer", None) is not None:
             self._layout_save_timer.stop()
+        try:
+            # 白板的镜头（缩放 + 画面中心）也要留住：用户"下次打开还停在原处"
+            self._save_board_camera()
+        except Exception:
+            pass
         try:
             self.save_layout_options()
         except Exception:
