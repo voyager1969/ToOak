@@ -477,6 +477,7 @@ class WordCompareJob(_Job):
         file_id: int,
         old_version_id: int,
         *,
+        engine: str = "",
         show: bool = True,
         author: str = "ToOak",
     ):
@@ -484,6 +485,8 @@ class WordCompareJob(_Job):
         self.version_id = version_id
         self.file_id = file_id
         self.old_version_id = old_version_id
+        #: 用哪一套比（``"word"`` / ``"wps"``；``""`` = 内核按本机情况挑）。
+        self.engine = engine
         #: True = 比较完把结果留在 Word 里给用户看（界面默认）
         self.show = show
         self.author = author
@@ -514,7 +517,7 @@ class WordCompareJob(_Job):
         try:
             result = wordcompare.compare(
                 pair["original_path"], pair["revised_path"], output,
-                author=self.author, show=self.show,
+                author=self.author, show=self.show, engine=self.engine,
             )
         except wordcompare.WordCompareError as error:
             self.events.put(WordCompareFinished(

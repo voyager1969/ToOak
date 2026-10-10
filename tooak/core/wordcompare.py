@@ -388,6 +388,45 @@ def engine_progids() -> list[str]:
     return [prog for _kind, prog, _label in engines()]
 
 
+#: 两套程序的名字（界面上就那么写）
+KIND_LABELS = {"word": "Word", "wps": "WPS"}
+
+
+def kinds(refresh: bool = False) -> list[str]:
+    """本机**装了**哪几套（``["word"]`` / ``["wps"]`` / ``["word", "wps"]`` / ``[]``）。
+
+    在菜单里做两个吧，没有就灰掉"）：这要的是**一家一家**的答案，
+    而 :func:`available` 只回答"有没有任意一套"。
+    """
+    found: list[str] = []
+    for kind, _prog, _label in engines(refresh=refresh):
+        if kind not in found:
+            found.append(kind)
+    return found
+
+
+def has_kind(kind: str, refresh: bool = False) -> bool:
+    """本机装了 ``kind`` 这一套吗（``"word"`` / ``"wps"``）。"""
+    return kind in kinds(refresh=refresh)
+
+
+def kind_label(kind: str) -> str:
+    """``"word"`` → ``"Word"``；``"wps"`` → ``"WPS"``。"""
+    return KIND_LABELS.get(kind, kind)
+
+
+def kind_reason(kind: str) -> str:
+    """这一套用不了时，写进置灰项的提示里的一句人话。
+
+    "我这台机器没装它"这一个结论，以及"为什么这一项本来就是灰的"。
+    """
+    label = kind_label(kind)
+    if sys.platform != "win32":
+        return f"「用 {label} 比较」只在 Windows 上可用（这一项要调用本机安装的 {label}）"
+    return (f"这台机器上没有找到 {label}：这一项要调用本机 {label} 的「审阅 → 比较」，"
+            f"装上 {label} 之后这里就能点了（也可以先用底侧「各稿」窗口里的内置比较）")
+
+
 def engine_hint() -> str:
     """菜单提示里那句"会用谁比、不行会换谁"。
 

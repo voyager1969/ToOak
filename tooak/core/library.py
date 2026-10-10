@@ -2828,16 +2828,24 @@ class Library:
 
         copy_name = normalize_new_name(new_name, fallback=item.name)
 
-        # 内容还在不在、还是不是当初那一份（只 stat，不读内容）
+        # **只拦"文件没了"这一种情况。**
+        #
+        # 以前这里连 `changed`（原文件被就地覆盖）也拦，理由是"登记过去也取不回内容"。
+        # 用户不认这一条："归档进去后编辑过了，编辑会影响它这个复制操作的有效性啊，
+        # 那不行。我其实并不在意归档过的文件是不是编辑过，不如说编辑才是常态的。"
+        # 他说得对：这里要做的只是**把现在磁盘上那份字节复制一份进这一稿** ——
+        # 文件被改过，复制到的就是改过之后的当前内容，这是正常的、也是用户想要的；
+        # 真正拦不住的只有"文件已经不在了"（那才真的没有内容可复制）。
+        # 唯一要守住的是**不许悄悄含糊**：文件被改过时结果里带 `source_changed=True`，
+        # 界面据此说一句"复制的是**现在**这份内容"。
         check = self.check_version_files(source_version_id)
-        for bucket, why in (("missing", "已经不在原处"),
-                            ("changed", "已经被就地覆盖，内容不是当初那一份了")):
-            if any(entry["file_id"] == item.id for entry in check[bucket]):
-                raise LibraryError(
-                    f"「{item.name}」（v{source.seq} 那份）{why}，"
-                    "登记过去也取不回内容；先用「重新绑定失效文件…」把它指回来，"
-                    "或者把现在磁盘上那份重新拖进方框（那会正常归档）"
-                )
+        if any(entry["file_id"] == item.id for entry in check["missing"]):
+            raise LibraryError(
+                f"「{item.name}」（v{source.seq} 那份）已经不在原处，"
+                "没有内容可以复制过来；先用「重新绑定失效文件…」把它指回来，"
+                "或者把现在磁盘上那份重新拖进方框（那会正常归档）"
+            )
+        source_changed = any(entry["file_id"] == item.id for entry in check["changed"])
 
         existing = next((row for row in target_version.files
                          if same_file_name(row.name, copy_name)), None)
@@ -2851,6 +2859,7 @@ class Library:
                 "target_seq": target_version.seq,
                 "existing_role_label": ROLE_LABELS.get(existing.role, existing.role),
                 "copied_into_library": False,
+                "source_changed": source_changed,
             }
 
         raw = self.db.query_one("SELECT * FROM version_files WHERE id = ?", (item.id,))
@@ -2922,6 +2931,9 @@ class Library:
             "copied_into_library": True,
             "size": info.size,
             "stored_path": info.rel_path,
+            # 源那一份在磁盘上被改过：界面据此说一句"复制的是**现在**这份内容"
+            # （不是拒绝，只是说清楚）
+            "source_changed": source_changed,
         }
 
     def rename_file(self, version_id: int, file_id: int, new_name: str) -> dict[str, Any]:
@@ -3351,29 +3363,55 @@ class Library:
         if target.document_id != document_id:
             raise LibraryError("该版本不属于此文档")
 
-        # 引用模式下要先确认「那个时期的文件」还在、还是当初那份。
-        # 否则"恢复"会静默地恢复成别的内容——比报错危险得多。
+        # 引用模式下要先确认「那个时期的文件」还在。
+        # 文件只是**被改过**不算问题（"改动是控在用户手里的"）：恢复出来的就是
+        # 现在磁盘上那份内容；但文件**没了**的时候，"恢复"只会恢复出一个空壳，
+        # 那比报错危险得多。
         if not force:
             check = self.check_version_files(version_id)
-            if check["missing"] or check["changed"]:
-                problems = check["missing"] + check["changed"]
+            if check["missing"]:
+                problems = check["missing"]
                 detail = "；".join(
                     f"{item['name']}（{item.get('reason', '')}）" for item in problems[:3]
                 )
                 raise LibraryError(
-                    f"v{target.seq} 的原始文件已不在原处或已被就地覆盖：{detail}。"
+                    f"v{target.seq} 的文件已经不在原处：{detail}。"
                     "内容无法从库里恢复；若只想恢复「引用了哪些文件」这个事实，"
                     "可用 force=True（界面会先提示）。"
                 )
 
-        specs = [
-            FileSpec(
-                path=self._file_path(item),
-                role=item.role,
-                name=item.name,
+        # 恢复**不需要文件还在磁盘上**：一条记录（路径 + 环节 + 指纹）本身就是
+        # "当时用了哪份文件"这个事实，恢复的就是它。所以这里照"沿用旧记录"那条路
+        # 建 spec（和归档新一稿时 ``carry_files`` 一个写法）：
+        #   * 文件没动过 → 直接用回原来的 blob（几 GB 的图纸不用再读一遍）；
+        #   * 文件被**就地改过** → ``_reusable`` 判不过，如实读现在磁盘上那一份
+        #     （"改动是控在用户手里的"，恢复出来就是现在的样子）；
+        #   * 文件**不在原处**（只有 force=True 能走到这儿，界面已提示过代价）→
+        #     不读盘、不报错，把这条记录原样恢复出来，内容取不回来这件事
+        #     如实记在 ``version.dropped`` 里。
+        missing_names: list[str] = []
+        specs: list[FileSpec] = []
+        for item in target.files:
+            path = self._file_path(item)
+            if path is None:
+                # 记录坏到连路径都没有（旧库导入的残行）：只保留名字，免得整条恢复失败
+                path = Path(item.name)
+            gone = not path.is_file()
+            if gone:
+                missing_names.append(item.name)
+            specs.append(
+                FileSpec(
+                    path=path,
+                    role=item.role,
+                    name=item.name,
+                    sha256=item.sha256 or None,
+                    reuse_blob_id=item.blob_id,
+                    reuse_size=item.size,
+                    reuse_mime=item.mime,
+                    reuse_location=item.location,
+                    reuse_missing=gone,
+                )
             )
-            for item in target.files
-        ]
         new_version, deduplicated = self.create_version(
             document_id,
             files=specs,
@@ -3393,6 +3431,12 @@ class Library:
                     "version_restored", document_id=document_id, version_id=new_version.id,
                     message=f"v{new_version.seq} ← v{target.seq}",
                 )
+        if missing_names and not deduplicated:
+            # 只恢复了"引用了哪些文件"这个事实、内容确实取不回来的那几份：
+            # 照 ``carry_files`` 的老规矩记在 dropped 里，界面照着它如实说明
+            new_version.dropped = list(new_version.dropped) + [
+                name for name in missing_names if name not in new_version.dropped
+            ]
         return new_version, deduplicated
 
     def delete_version(self, version_id: int, *, keep_last: bool = True) -> None:
@@ -3666,18 +3710,20 @@ class Library:
         return text
 
     def _diff_guard(self, old_version_id: int, role: str | None = None):
-        """比较前的守门：旧稿的文件若已不可比，就如实说明，不做假比较。
+        """比较前的守门：**只拦"比了会得出假结论"的那一种情况**。
 
-        为什么必须有这道门：文件留在原处（引用模式）时，旧稿记录的是
-        "当时那个路径 + 当时的指纹"。如果那个文件后来被**就地覆盖**，
-        两侧解析出来的是同一个路径、同样的字节 —— 直接比较会得出
+        改动是控在用户手里的"。所以这里不再因为"这份文件被改过"就拒绝比较 ——
+        改过就按现在的字节比，那是用户自己磁盘上的事实。
 
-        **只 stat，不读内容**（``deep=False``）：判断"旧稿那份文件还在不在、
-        还是不是那一份"，存在性和大小就够了。这里原来跑的是逐字节 sha256，
-        于是旧稿上有几个 GB（含 GB 级压缩包）的事件，每切一稿都要把那些字节全读一遍
-        ——实测接近一分钟，而结论和只 stat 完全一样。
-        真要"逐字节证明没变"，那是 ``check_version_files(deep=True)`` 的事，
-        只由用户显式触发（界面上的「校验文件」、CLI），不放在自动路径上。
+        真正要拦的只有一件：**两侧解析到同一个路径、而登记的指纹不一样**。
+        文件留在原处（引用模式）时，旧稿记录的是"当时那个路径 + 当时的指纹"，
+        如果那个文件后来被就地覆盖，两侧解出来就是同一个路径、同样的字节 ——
+        这不是"盯着用户改没改"，而是"拿一份文件和它自己比"没有意义。
+
+        **只 stat，不读内容**（``deep=False``）：判断"旧稿那份文件还在不在"，
+        存在性就够了。这里原来跑的是逐字节 sha256，于是旧稿上有几个 GB
+        （含 GB 级压缩包）的事件，每切一稿都要把那些字节全读一遍 ——
+        实测接近一分钟，而结论和只 stat 完全一样。
         """
         from . import diffing
 
@@ -3699,18 +3745,19 @@ class Library:
                         and self._file_path(old_file) == self._file_path(new_file)):
                     return diffing.DiffResult(
                         kind="binary",
-                        summary=f"上一稿的内容已不可比：{old_file.name}"
-                                "（这份文件被就地覆盖过，历史内容已经没了）",
+                        summary=f"不可比：两稿指的是同一份文件 {old_file.name}"
+                                "（登记着不同的内容指纹，说明它被就地改过）",
                         details=[
-                            f"{old_file.name}：现在这个路径上放的是另一份内容",
-                            "文件留在原处时，库里保存的只是「当时那份内容」的记录；",
-                            "同一个路径被覆盖之后，就没法再拿它当「当时那份」来比了。",
+                            f"{old_file.name}：两稿解析到的是同一个路径",
+                            "两稿登记着不同的内容指纹，说明这份文件被就地改过，"
+                            "历史那一稿的内容已经取不回来了。",
+                            "拿一份文件和它自己比没有意义，所以这里不给结论。",
                             "要留住历史内容，归档时请用「复制进库」。",
                         ],
                     )
 
         check = self.check_version_files(old_version_id)
-        broken = check["missing"] + check["changed"]
+        broken = check["missing"]           # 只有"文件没了"才真的没法比
         if role:
             allowed = {
                 item.id for item in self.get_version(old_version_id).files
@@ -3723,14 +3770,14 @@ class Library:
         return diffing.DiffResult(
             kind="binary",
             summary=f"上一稿的内容已不可比：{names}"
-                    + ("（文件已被就地覆盖或移走）" if len(broken) <= 3 else " 等文件已不可比"),
+                    + ("（文件已经被移走）" if len(broken) <= 3 else " 等文件已不可比"),
             details=[
                 f"{item['name']}：{item.get('reason', '不可读')}" for item in broken[:5]
             ]
             + [
-                "文件留在原处时，库里保存的是「当时那个路径、当时的大小与指纹」；",
-                "现在这个路径上的文件已经变样（大小对不上）或不见了，",
-                "所以没法再把它当成「当时那份内容」来比。要留住历史内容，归档时请用「复制进库」。",
+                "文件留在原处时，库里保存的是「当时那个路径」；",
+                "现在这个路径上已经没有文件了，所以没法再把它当成「当时那份内容」来比。",
+                "要留住历史内容，归档时请用「复制进库」。",
             ],
         )
 
@@ -4037,7 +4084,9 @@ class Library:
         * ``word_available`` / ``word_reason``：本机 Word / WPS 能不能用
           （不能用时置灰 + 写明原因）；
         * ``word_engine``：本机装的是哪一套（``"Word"`` / ``"WPS 文字"`` /
-          ``"Word 或 WPS"``）—— 菜单标题照它写，用户才知道点下去谁会跳出来；
+          ``"Word 或 WPS"``）；
+          word/wps 比较，在菜单里做两个吧，没有就灰掉"）——
+          每条 ``{kind, label, available, reason, progids}``；
         * ``candidates``：更早的稿里能比的那些，**从近到远**，
           每条 ``{version_id, file_id, seq, name, label, when, is_previous}``；
         * ``reason``：一个候选都没有时的人话（写进置灰项的提示里）。
@@ -4054,6 +4103,18 @@ class Library:
         document = self.get_document(target_version.document_id)
         target = next((item for item in target_version.files if item.id == file_id), None)
 
+        installed = set(wordcompare.kinds())
+        engine_rows = [
+            {
+                "kind": kind,
+                "label": wordcompare.kind_label(kind),
+                "available": kind in installed,
+                "reason": "" if kind in installed else wordcompare.kind_reason(kind),
+                "progids": [prog for row_kind, prog, _label in wordcompare.engines()
+                            if row_kind == kind],
+            }
+            for kind in ("word", "wps")
+        ]
         info: dict[str, Any] = {
             "version_id": version_id,
             "file_id": file_id,
@@ -4065,6 +4126,7 @@ class Library:
             "word_reason": wordcompare.unavailable_reason(),
             "word_engine": wordcompare.engine_label(),
             "word_hint": wordcompare.engine_hint(),
+            "engines": engine_rows,
             "candidates": [],
             "reason": "",
         }

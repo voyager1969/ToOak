@@ -22,7 +22,12 @@ from pathlib import Path
 __all__ = ["VERSION", "APP_NAME", "build_stamp", "version_text", "version_line"]
 
 #: 语义版本号。改动大到用户能感觉出来的量级就往上走一位。
-VERSION = "0.5.0"
+#:
+#: 0.5.1：折叠不再换位置、不再盯着用户改没改文件、Word / WPS 各一个比较入口。
+#: 为什么这种"只改代码"的更新也要往上走一位：分发是**便携包**，
+#: 用户手上那个 exe 只有版本号能对上（打包之后不显示提交号），
+#: 号不动的话"到底覆盖上新版没有"从界面上看不出来。
+VERSION = "0.5.1"
 
 APP_NAME = "ToOak"
 

@@ -716,6 +716,8 @@ class MainWindow(QMainWindow):
         self.board_view.groupDeleteRequested.connect(self._delete_board_group)
         self.board_view.groupExportRequested.connect(self._export_board_group)
         self.board_view.groupMembershipRequested.connect(self._set_group_membership)
+        # 卡片被丢进组框里的**空白处**（不是标题栏）：问一句再改归属
+        self.board_view.groupDropRequested.connect(self._ask_group_drop)
         self.board_view.edgeCurveRequested.connect(self._set_edge_curve)
         self.board_view.exportSelectionRequested.connect(self._export_selection)
         self.board_view.createItemRequested.connect(self._on_canvas_create_requested)
@@ -2827,6 +2829,51 @@ class MainWindow(QMainWindow):
         self._refresh_sidebar()
         self.show_message("已恢复依赖告警")
 
+    def _ask_group_drop(self, group_id: int, document_id: int) -> None:
+        """卡片被丢进组框的**空白处**：问一句再改归属。
+
+        组里的事件卡片分类发生变化"。原来的规矩是"落点在框里就加入"，而框是一个
+        很大的区域 —— 在白板上挪一张卡片、或者框因为成员变化而长大，都会让人
+        "莫名其妙进了组、还从原来那个组里退了出来"（v19 是移动语义）。
+
+        现在分两种落点，都不再靠猜：
+
+        * **标题栏**上（窄窄一条，形状就是投放目标）→ 直接加入，不问；
+        * **框里的空白处**（大面积，很可能只是"想摆在这儿"）→ 就是这里：
+          问一句，并在问的话里写清会从哪个组移过来。
+
+        拒绝也不影响位置 —— 卡片已经按你拖的放好了，这一步只改归类。
+        想让拖进去就直接加入，把卡片丢到那个组的**标题栏**上（悬停时会亮起来）。
+        """
+        document = self.library.get_document(document_id)
+        group = next((item for item in self._board_groups() if item["id"] == group_id),
+                     None)
+        if document is None or group is None:
+            return
+        name = group.get("name") or "未命名组"
+        current = self.library.group_of_document(document_id)
+        if current is not None and int(current["id"]) == int(group_id):
+            return                            # 本来就是这一组的人：不用问
+        if current is not None:
+            title = "改这个事件枝的归类"
+            text = (
+                f"把「{document.title}」从「{current['name'] or '未命名组'}」"
+                f"移到「{name}」吗？\n\n"
+                "一个事件枝只能在一个分组下，所以它会从原来那个组里移出来。\n"
+                "卡片位置已经按你拖的放好了，这一步只改归类。\n\n"
+                "（想让拖进去就直接加入，把卡片丢到那个组的标题栏上）"
+            )
+        else:
+            title = "把这个事件枝加进分组"
+            text = (
+                f"把「{document.title}」加进「{name}」吗？\n\n"
+                "卡片位置已经按你拖的放好了，这一步只改归类。\n\n"
+                "（想让拖进去就直接加入，把卡片丢到那个组的标题栏上）"
+            )
+        if not self._confirm(title, text):
+            return
+        self._set_group_membership(group_id, [document_id], True)
+
     def _save_group_rect(self, group_id: int, x: float, y: float,
                          w: float, h: float) -> None:
         """用户把分组框拖大拖小了：记下来，并且从此不再跟着成员收紧。"""
@@ -2878,8 +2925,10 @@ class MainWindow(QMainWindow):
         ids = [int(item) for item in (document_ids or [])]
         if not ids:
             return
-        # 组变空时先把框的位置记住：不然空组会跑回原点
-        rect = self.board_view.group_rect_for(group_id)
+        # 组变空时先把框的位置记住：不然空组会跑回原点。
+        # 取的是**摊开那个大框**（full=True）：折起来时画出来的只有标题栏那一条，
+        # 照它写 x/y/w/h 等于把这一组压成一条扁框，摊开回来就没了
+        rect = self.board_view.group_rect_for(group_id, full=True)
         current = next((item for item in self._board_groups()
                         if item["id"] == group_id), {})
         before_members = {int(item) for item in (current.get("members") or [])}
@@ -3294,8 +3343,17 @@ class MainWindow(QMainWindow):
             self.show_project_board(self._project_id, keep_view=True)
 
     def _save_positions(self, payload) -> None:
-        """一次拖动的落点（可能带走一组卡片）：一次写库、只重画一遍，并记进撤销栈。"""
-        positions, before = payload if isinstance(payload, tuple) else (payload, {})
+        """一次拖动的落点（可能带走一组卡片）：一次写库、只重画一遍，并记进撤销栈。
+
+        负载是 ``(positions, before)`` 或 ``(positions, before, join)`` ——
+        第三项决定**这次移动要不要顺带改分组归属**：拖卡片自己 = 要，
+        拖分组框（成员只是跟着走）= 不要。见 ``apply_positions`` 的说明。
+        """
+        if isinstance(payload, tuple):
+            positions, before = payload[0], payload[1]
+            join = payload[2] if len(payload) > 2 else True
+        else:
+            positions, before, join = payload, {}, True
         # 记下"动之前库里到底存没存过位置"：没存过的话，撤销应该是**清掉位置**
         # （回到自动布局），而不是给一个值 —— 否则从此这个节点就"手工摆放"了
         stored = set()
@@ -3311,7 +3369,7 @@ class MainWindow(QMainWindow):
             self.show_message(f"保存位置失败：{error}")
             return
         # 就地更新坐标就行：不重建场景（不然拖一下闪一下，连续微调也没法用）
-        self.board_view.apply_positions(positions)
+        self.board_view.apply_positions(positions, join=join)
         self._record_move(positions, before, stored)
         if self._project_id:
             self._apply_board_header(
@@ -4172,6 +4230,9 @@ class MainWindow(QMainWindow):
             f"{human_size(result.get('size') or 0)}）"
             + (f"；它原来登记在 v{result.get('source_seq')}"
                if result.get("source_seq") != result.get("target_seq") else "")
+            # 源那一份在磁盘上被改过：**不拦**，只说清复制的是现在这份内容
+            + ("；那一份在磁盘上改过，所以复制过来的是它**现在**的内容"
+               if result.get("source_changed") else "")
         )
 
     def word_compare_info(self, version_id: int, file_id: int) -> dict:
@@ -4185,13 +4246,22 @@ class MainWindow(QMainWindow):
         except LibraryError:
             return {}
 
-    def _word_compare(self, version_id: int, file_id: int, old_version_id: int) -> None:
-        """右键「用 Word 比较 → 与 vN 比较」：后台起 Word 比一份带修订的文档出来。"""
-        job = WordCompareJob(self.library_root, version_id, file_id, old_version_id)
+    def _word_compare(self, version_id: int, file_id: int, old_version_id: int,
+                      engine: str = "") -> None:
+        """右键「用 Word / WPS 比较 → 与 vN 比较」：后台比一份带修订的文档出来。
+
+        ``engine`` 是用户**点的那一条**（``"word"`` / ``"wps"``）：指定了就只用它
+        点了 WPS 却在后台换成 Word，属于"菜单写的和实际干活的不是同一个"，
+        """
+        job = WordCompareJob(self.library_root, version_id, file_id, old_version_id,
+                             engine=engine)
         self._word_jobs[job.id] = job
         job.start()
         # 说清"要等一会儿"，否则用户以为点了没反应（Word 冷启动实测十几秒）
-        self.show_message("正在用 Word 比较…（要启动 Word，第一次可能要十几秒）")
+        from ..core import wordcompare
+
+        who = wordcompare.kind_label(engine) if engine else "Word / WPS"
+        self.show_message(f"正在用 {who} 比较…（要启动 {who}，第一次可能要十几秒）")
 
     def _on_word_compare_finished(self, event: WordCompareFinished) -> None:
         """比较完了：成功就把结果摆到用户面前，失败就如实说清为什么。
@@ -4472,17 +4542,18 @@ class MainWindow(QMainWindow):
         if version is None or self._document_id is None:
             return
         check = self.library.check_version_files(version_id)
-        broken = check["missing"] + check["changed"]
+        # 恢复出来的就是现在磁盘上那份内容。
+        broken = check["missing"]
         if broken:
             names = "、".join(item["name"] for item in broken[:3])
             if not self._confirm(
                 "恢复到旧版（注意）",
-                f"v{version.seq} 的原始文件已不在原处或已被就地覆盖：{names}\n\n"
+                f"v{version.seq} 的文件已经不在原处：{names}\n\n"
                 "库内只保留了当时的**内容指纹**，字节本身取不回来。\n"
                 "继续的话，新版本只会恢复「当时引用了哪些文件」这个事实。\n\n仍然继续？",
             ):
                 return
-            note = f"恢复到 v{version.seq}（原文件已变化）"
+            note = f"恢复到 v{version.seq}（原文件不在原处）"
             force = True
         else:
             if not self._confirm(

@@ -44,7 +44,7 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, QSizeF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -656,9 +656,13 @@ class ProjectDocumentItem(QGraphicsItem):
             scene = self.scene()
             if scene is not None and hasattr(scene, "refresh_edges_for"):
                 scene.refresh_edges_for(self)
+            # 拖着卡片经过某个组框时，把那个框点亮 —— 用户才知道"松手会问/会加进
+            # 哪一个组"（不然落点在框里还是框外全靠猜）
+            view = getattr(scene, "view", None)
+            if view is not None and self._dragging:
+                view.highlight_drop_target(self)
             # 事件枝上的功能"）—— 用**上一帧**的位置算位移，所以先把新位置记下来之前
             # 先取旧的（_last_pos 在下面更新）
-            view = getattr(scene, "view", None)
             if view is not None and self._last_pos is not None:
                 view._follow_card(self, self.pos() - self._last_pos)
             self._last_pos = QPointF(self.pos())
@@ -703,6 +707,9 @@ class ProjectDocumentItem(QGraphicsItem):
             scene = self.scene()
             if scene is not None and hasattr(scene, "notify_moved"):
                 scene.notify_moved(self)
+        view = getattr(self.scene(), "view", None)
+        if view is not None:
+            view.clear_drop_hover()          # 松手：组框上的"可以放进来"收掉
 
         self._press_origin = None
         self._clear_group()
@@ -1654,6 +1661,8 @@ class BoardGroupItem(QGraphicsItem):
         #: 重锚一次），照它算出来的 before 是拖动中途的位置，撤不回原样
         self._press_origins: dict[ProjectDocumentItem, QPointF] = {}
         self._moving_members = False
+        #: 正有一张卡片被拖到自己身上（画成"可以放进来"的样子）
+        self._drop_hover = False
         self.setZValue(0)
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -1665,44 +1674,55 @@ class BoardGroupItem(QGraphicsItem):
 
     # ------------------------------------------------------------- 几何
 
-    def fit_to_members(self) -> None:
-        """排一下这个框：
+    def full_rect(self) -> QRectF:
+        """这个组**摊开**时那个大框在哪儿。
 
         * 组里有事件枝、而且**没被用户手工定过大小** → 框跟着成员收紧
           （往里拖一个新事件枝，框就自动变大把它围进来）；
         * 空组、或者用户手工拖过大小（``group.manual``）→ 用库里记的矩形，
-          空组也照着默认尺寸画出来，方便先摆好位置再往里放事件枝；
-        * **折叠**时只剩标题栏那一条：宽度沿用这个框原来的宽（不小于
-          ``COLLAPSED_W``）、高度就是标题栏 —— 成员的位置一个都不动，
-          展开时按同一套规矩重算回大框。
+          空组也照着默认尺寸画出来，方便先摆好位置再往里放事件枝。
+
+        折叠时**画**的是标题栏那一条，但位置照样按这个大框算 —— 见
+        :meth:`fit_to_members`。
         """
         group = self.group
-        if group.collapsed:
-            width = max(group.w or (self._last_rect.width() if self._last_rect
-                                    else DEFAULT_GROUP_W), self.COLLAPSED_W)
-            x = group.x or (self._last_rect.left() if self._last_rect else 0.0)
-            y = group.y or (self._last_rect.top() if self._last_rect else 0.0)
-            target = QRectF(x, y, width, self.HEADER_H)
-        elif self.members and not group.manual:
+        if self.members and not group.manual:
             rect = self.members[0].sceneBoundingRect()
             for item in self.members[1:]:
                 rect = rect.united(item.sceneBoundingRect())
-            target = QRectF(
+            return QRectF(
                 rect.left() - self.PADDING,
                 rect.top() - self.PADDING - self.HEADER_H,
                 rect.width() + self.PADDING * 2,
                 rect.height() + self.PADDING * 2 + self.HEADER_H,
             )
-            self._last_rect = target
+        last = self._last_rect
+        return QRectF(
+            group.x or (last.left() if last else 0.0),
+            group.y or (last.top() if last else 0.0),
+            group.w or (last.width() if last else DEFAULT_GROUP_W),
+            group.h or (last.height() if last else DEFAULT_GROUP_H),
+        )
+
+    def fit_to_members(self) -> None:
+        """排一下这个框：大小按 :meth:`full_rect` 算，折叠时只换尺寸。
+
+        不要放到新的位置上，维持左上角的坐标一致"）—— 折起来就是把大框压扁，
+        不是把它挪走；展开回来当然还是原地。
+
+        以前折叠那一条是按库里 ``x/y/w`` 那几列摆的：自动收紧的组那几列
+        停在**建组那一刻**（多半还是 0），成员后来挪到哪儿它根本不知道，
+        而且重画一遍（切走再回来）之后连"上一帧的大框"都没有了 ——
+        于是折起来的那一条啪地跳到画布左上角去。现在一律先算出大框，
+        折叠只是把它的高度换成标题栏（宽度不够 ``COLLAPSED_W`` 时补到够）。
+        """
+        full = self.full_rect()
+        self._last_rect = full
+        if self.group.collapsed:
+            target = QRectF(full.left(), full.top(),
+                            max(full.width(), self.COLLAPSED_W), self.HEADER_H)
         else:
-            width = group.w or (self._last_rect.width() if self._last_rect
-                                else DEFAULT_GROUP_W)
-            height = group.h or (self._last_rect.height() if self._last_rect
-                                 else DEFAULT_GROUP_H)
-            x = group.x or (self._last_rect.left() if self._last_rect else 0.0)
-            y = group.y or (self._last_rect.top() if self._last_rect else 0.0)
-            target = QRectF(x, y, width, height)
-            self._last_rect = target
+            target = full
 
         self.prepareGeometryChange()
         self.setPos(target.topLeft())
@@ -1738,6 +1758,17 @@ class BoardGroupItem(QGraphicsItem):
     def header_rect(self) -> QRectF:
         return QRectF(0, 0, self._rect.width(), self.HEADER_H)
 
+    def header_scene_rect(self) -> QRectF:
+        """标题栏在**场景坐标**里的那条（拖卡片时用落点判断"是不是丢在标题栏上"）。"""
+        return QRectF(self.pos(), QSizeF(self._rect.width(), self.HEADER_H))
+
+    def set_drop_hover(self, value: bool) -> None:
+        """拖着一张卡片经过这个组时，把框画成"可以放进来"的样子。"""
+        if value == self._drop_hover:
+            return
+        self._drop_hover = bool(value)
+        self.update()
+
     def toggle_collapsed(self) -> None:
         """把这组折起来 / 摊开（真正的写库与重画由主窗口做）。
 
@@ -1766,8 +1797,10 @@ class BoardGroupItem(QGraphicsItem):
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pen = QPen(QColor(SELECTION_COLOR if self.isSelected() else self.BORDER))
-        pen.setWidthF(2.6 if self.isSelected() else 1.2)
+        highlight = self.isSelected() or self._drop_hover
+        pen = QPen(QColor(SELECTION_COLOR if self.isSelected() else
+                          (ACCENT if self._drop_hover else self.BORDER)))
+        pen.setWidthF(2.6 if highlight else 1.2)
         painter.setPen(pen)
         painter.setBrush(QBrush(QColor(self.group.color or self.FILL)))
         painter.drawRoundedRect(self._rect, 12, 12)
@@ -2016,7 +2049,9 @@ class BoardGroupItem(QGraphicsItem):
             if positions:
                 before = {item.node.document_id: (origin.x(), origin.y())
                           for item, origin in origins.items()}
-                self.view.positionsChanged.emit((positions, before))
+                # 第三个 False = **这次移动不要碰分组归属**：成员是跟着组框走的，
+                # 不是被"拖进某个框"（详见 apply_positions 的 join 参数）
+                self.view.positionsChanged.emit((positions, before, False))
             return
         self.group.w, self.group.h = rect.width(), rect.height()
         # 框的**本体**拖完也要把矩形写回库。只发 positionsChanged 时：
@@ -2034,7 +2069,9 @@ class BoardGroupItem(QGraphicsItem):
             return
         before = {item.node.document_id: (origin.x(), origin.y())
                   for item, origin in origins.items()}
-        self.view.positionsChanged.emit((positions, before))
+        # 同上：拖的是**整个组框**，成员只是跟着走 —— 别让它们被"过继"给
+        # 卡片分类发生变化"）
+        self.view.positionsChanged.emit((positions, before, False))
 
     def itemChange(self, change, value):  # noqa: N802
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -2266,6 +2303,9 @@ class ProjectBoardView(QGraphicsView):
     emptyGroupRequested = Signal(float, float)
     #: 分组框被拖大拖小了：``(组 id, x, y, w, h)``
     groupRectChanged = Signal(int, float, float, float, float)
+    #: 用户把**卡片**丢进了组框里的空白处：``(组 id, 事件 id)`` ——
+    #: 由主窗口问一句"加进这一组吗"再改（见 ``_handle_group_drop``）
+    groupDropRequested = Signal(int, int)
     #: 折叠的分组框被拖动：``(组 id, x, y)`` —— **只挪位置**，大小一个字不动
     #: （见 ``BoardGroupItem.mouseReleaseEvent`` 里那段说明）
     groupMoved = Signal(int, float, float)
@@ -2427,6 +2467,28 @@ class ProjectBoardView(QGraphicsView):
     def visible_scene_rect(self) -> QRectF:
         return self.mapToScene(self.viewport().rect()).boundingRect()
 
+    def highlight_drop_target(self, item: ProjectDocumentItem | None) -> None:
+        """拖卡片时把落点所在的组框点亮；``item is None`` = 全部熄灭。
+
+        """
+        hit = None
+        if item is not None:
+            center = item.sceneBoundingRect().center()
+            document_id = item.node.document_id
+            for group_item in self._group_items.values():
+                if document_id in set(group_item.group.document_ids):
+                    continue
+                if group_item.scene_rect().contains(center):
+                    hit = group_item
+                    break
+        for group_item in self._group_items.values():
+            group_item.set_drop_hover(group_item is hit)
+
+    def clear_drop_hover(self) -> None:
+        """松手/取消拖动之后，把所有组框的"可以放进来"状态收掉。"""
+        for group_item in self._group_items.values():
+            group_item.set_drop_hover(False)
+
     def ensure_scene_room(self, *, grow: bool = True) -> None:
         """保证"看得见的这一块 + 一圈空白"都在画布范围内；不够就往外扩。
 
@@ -2477,11 +2539,16 @@ class ProjectBoardView(QGraphicsView):
     def graph(self) -> ProjectGraph | None:
         return self._graph
 
-    def apply_positions(self, positions: dict) -> None:
+    def apply_positions(self, positions: dict, *, join: bool = False) -> None:
         """拖完只**就地**更新落点与相关连线 —— 不重建场景。
 
         重建会让整块画布闪一下、选中也丢了（连续用方向键微调时就废了），
         而拖动本来就只改坐标这一件事。
+
+        :param join: 这次移动要不要**顺带改分组归属**。默认 ``False`` ——
+            "拖进组框就算这个组的人"只在**用户拖的是卡片自己**时才成立
+            （见 :meth:`_handle_group_drop`）；拖分组框时成员是跟着框走的，
+            绝不能被"过继"给落点下面的另一个组。
         """
         moved = False
         for document_id, (x, y) in positions.items():
@@ -2497,32 +2564,64 @@ class ProjectBoardView(QGraphicsView):
             self._graph.manual = True
             self._graph.layout = "manual"
         if moved:
-            self._join_groups_for(positions)  # 拖进哪个组就算哪个组的人
+            if join:
+                self._handle_group_drop(positions)
             self.refresh_groups()           # 分组框跟着成员收紧（等于自动变大）
             self.ensure_scene_room()        # 拖到边上时画布跟着往外长
 
-    def _join_groups_for(self, positions: dict) -> None:
-        """
+    def _handle_group_drop(self, positions: dict) -> None:
+        """用户拖的**卡片**落进了某个组框里：按落点决定是"直接加入"还是"问一句"。
 
-        先把"该加入谁"收集完再逐个发信号：接收方**会重建整个场景**
+        问题在于框是一个**很大的区域**：在白板上挪一张卡片、或者框本身因为成员变化
+        而长大，都会让人"莫名其妙进了组/换了组"（v19 起加入还是**移动**语义，
+        会顺手从原来那个组里退出来）。
+
+        现在的规矩分两种落点，都很明确：
+
+        * 落在**标题栏**上（那一条窄框，形状就是"一个投放目标"）→
+          **直接加入**，不再问 —— 把卡片丢在标题栏上本身就是明确的意思表示；
+        * 落在**框里的空白处**（大面积区域，很容易是"只是想摆在这儿"）→
+          发 :attr:`groupDropRequested`，由主窗口**问一句**再改；
+          *本来就是这个组的人、或者落点压根不在任何组里 → 什么都不做。*
+
+        先把"该找谁"收集完再逐个发信号：接收方会重建整个场景
         （``_group_items`` 被 clear 之后重填），边迭代边发信号等于在换过一茬的
         字典上继续跑 —— 有的组会被漏掉、有的会被重复处理。
         """
-        pending: list[tuple[int, int]] = []
+        immediate: list[tuple[int, int]] = []
+        ask: list[tuple[int, int]] = []
         for group_item in self._group_items.values():
             rect = group_item.scene_rect()
+            header = group_item.header_scene_rect()
             members = set(group_item.group.document_ids)
             for document_id in positions:
                 if document_id in members:
-                    continue
+                    continue                    # 已经是这组的人：不用改
                 item = self._items.get(document_id)
                 if item is None:
                     continue
                 center = item.sceneBoundingRect().center()
-                if rect.contains(center):
-                    pending.append((group_item.group.id, document_id))
-        for group_id, document_id in pending:
-            self.groupMembershipRequested.emit(group_id, [document_id], True)
+                if not rect.contains(center):
+                    continue
+                if group_item.collapsed or header.contains(center):
+                    # 折起来时那一条**就是**标题栏：丢上去就是"放进这一组"
+                    immediate.append((group_item.group.id, document_id))
+                else:
+                    ask.append((group_item.group.id, document_id))
+        for group_id, document_id in immediate:
+            # **排到下一次事件循环**再发：这一手是在卡片自己那次 mouseReleaseEvent
+            # 里走的，而接收方（主窗口）会重建整个场景 —— 当场发等于把"正在处理
+            # 松手事件的那张卡片"删掉，Qt 随即报 "Internal C++ object already
+            # ``MainWindow._move_file_role``）。
+            QTimer.singleShot(
+                0, lambda gid=group_id, did=document_id:
+                self.groupMembershipRequested.emit(gid, [did], True)
+            )
+        for group_id, document_id in ask:
+            QTimer.singleShot(
+                0, lambda gid=group_id, did=document_id:
+                self.groupDropRequested.emit(gid, did)
+            )
 
     def edges(self) -> list[_EdgeItem]:
         return self._edge_items
@@ -2676,11 +2775,18 @@ class ProjectBoardView(QGraphicsView):
         """现在折起来的那几个分组（测试与菜单要用）。"""
         return [item for item in self._group_items.values() if item.collapsed]
 
-    def group_rect_for(self, group_id: int) -> tuple[float, float, float, float] | None:
+    def group_rect_for(self, group_id: int, *, full: bool = False
+                       ) -> tuple[float, float, float, float] | None:
+        """框的矩形 ``(x, y, w, h)``。
+
+        ``full=True`` 时给的是**摊开**那个大框（``BoardGroupItem.full_rect``）——
+        折起来的分组画出来只有标题栏那一条，照它写库等于把这一组压成一条扁框
+        （摊开回来就没了），所以"要写库"的那几处一律取大框。
+        """
         item = self._group_items.get(group_id)
         if item is None:
             return None
-        rect = item.scene_rect()
+        rect = item.full_rect() if full else item.scene_rect()
         return rect.x(), rect.y(), rect.width(), rect.height()
 
     def item_for(self, document_id: int) -> ProjectDocumentItem | None:

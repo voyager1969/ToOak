@@ -473,8 +473,7 @@ class FileRow(QWidget):
         meta_bits: list[str] = []
         if self.missing == "missing":
             meta_bits.append("⚠ 文件缺失")
-        elif self.missing == "changed":
-            meta_bits.append("⚠ 内容已变")
+        # 改动是控在用户手里的" —— 文件被改过是常态，不值得在这行挂警示。
         if self.stale:
             meta_bits.append(self.entry.stale_note or "未登记")
         meta_bits.append("入库 " + format_archived_at(entry.created_at))
@@ -591,7 +590,7 @@ class FileRow(QWidget):
     def _build_tooltip(self) -> str:
         notes = {
             "missing": "⚠ 这个文件已经不在原来的位置了（内容取不回来）",
-            "changed": "⚠ 这个文件被就地改过（库里留的是当时的大小与指纹，字节已经变了）",
+            # 没有 "changed"：文件被改过是常态，不值得在提示里念叨
         }.get(self.missing, "双击打开 · 右键更多操作")
         if self.stale:
             notes = (
@@ -1416,8 +1415,9 @@ class EventStageView(QGraphicsView):
     addFilesRequested = Signal(int, str)
     #: 看某个环节的年轮（事件 id, 环节）
     stageFlowRequested = Signal(int, str)
-    #: 用 Word 自己的比较功能比这一份文件（版本 id, 文件 id, 要比的那一稿）
-    fileWordCompareRequested = Signal(int, int, int)
+    #: 用本机程序的比较功能比这一份文件
+    #: （版本 id, 文件 id, 要比的那一稿, 用哪一套：``"word"`` / ``"wps"``）
+    fileWordCompareRequested = Signal(int, int, int, str)
     #: 把"未登记"的那一份文件**另外登记到某一稿**（它所属的稿, 文件 id, 目标稿）
     #: —— 界面上的「复制一份到这一稿 / 到最新稿」，目标稿由**用户看到的那行字**决定
     fileRegisterRequested = Signal(int, int, int)
@@ -2122,19 +2122,23 @@ class EventStageView(QGraphicsView):
         """这一稿的「环节 → 文件卡片」；当前稿没登记的环节回落到它最后登记的那一稿。"""
 
         def status_of(item) -> str:
+            """这一行要不要挂个警示：**只在"文件没了"时挂**。
+
+            改动是控在用户手里的。" 所以以前那个"大小和归档时不一样 → 标成
+            「内容已变」"的判断去掉了：改文件是常态，页面上不该为此挂个 ⚠。
+            文件**不在原处**是另一回事 —— 那是真的打不开了，得说。
+            """
             if not item.location:
                 return ""
             path = Path(item.location)
             if not path.is_file():
                 return "missing"
             try:
-                size = path.stat().st_size
+                path.stat()
             except OSError:
                 # is_file() 与 stat() 之间文件被移走/没权限读：不能让它抛出去，
                 # 这里只是一个"卡片上要不要标警示"的判断，抛出去整个事件枝页都画不出来
                 return "missing"
-            if item.size and size != item.size:
-                return "changed"
             return ""
 
         def make_entry(item, stale: bool) -> FileEntry:
@@ -3012,66 +3016,88 @@ class EventStageView(QGraphicsView):
         ).setToolTip(tip)
 
     def _add_word_compare_menu(self, menu: QMenu, entry: FileEntry) -> None:
-        """「用 Word 比较」子菜单：调**本机程序自己的**比较功能（审阅 → 比较 → 比较文档）。
+        """「用 Word 比较」/「用 WPS 比较」子菜单：调**本机程序自己的**比较功能
+        （审阅 → 比较 → 比较文档）。
 
-        后来又补了一句"自动添加 wps 比较功能的支持"。
+        wps 比较功能的支持"，再后来是这一条："我想指定用 word/wps 比较呢，
+        在菜单里做两个吧，没有就灰掉"。
+
+        所以这里**一家一个入口**（不再是"用 Word 或 WPS 比较"那种合成一条、
+        点下去由内核挑）：用户点哪一个，就是哪一个去干活 —— 两套都装着的机器上
+        "到底谁跳出来"不该由程序猜。某一家没装就把它那一条**灰掉**并写明原因，
+        另一条照常能点。
 
         四条纪律：
 
         * **不是 Word 文件就整块不出现**（不是灰着占地方）：一份 PDF / 图纸
           拿去调文字处理软件毫无意义，菜单里多一行只会让人点一下试试；
-        * **没装 Word 也没装 WPS 时出现但置灰**，提示里写明为什么 —— 用户至少知道
+        * **没装的那一家出现但置灰**，提示里写明为什么 —— 用户至少知道
           "这个软件本来有这个功能，是我这台机器没装"，而不是以为功能不存在；
-        * **标题按本机装了什么写**（"用 Word 比较" / "用 WPS 文字比较"）：
-          装了两套时写"用 Word 或 WPS 比较"，点下去谁干活由内核按优先级挑
-          （见 ``core/wordcompare.ENGINES``）；
+        * **指定了就只用它**（``engine=kind`` 传给内核，见 ``wordcompare.compare``）：
+          那类问题，一次都不该再有；
         * **只列更早的稿**，每条都写清是哪一稿的哪一份文件（跨环节配上的还要写出角色）。
           比的是"这一稿相对上一稿改了什么"，反向比较交给底侧的「各稿」窗口。
         """
         info = self.word_compare_info(entry.version_id, entry.file_id)
         if not info or not info.get("is_word"):
             return
-        engine_label = str(info.get("word_engine") or "Word")
-        hint = str(info.get("word_hint") or "")
-        submenu = menu.addMenu(compare_icon(16), f"用 {engine_label} 比较")
-        submenu.setToolTip(
-            f"调用{('本机 ' + engine_label) if not hint else hint} 的「审阅 → 比较」，"
-            "生成一份带修订标记的文档；\n"
-            "库里的文件与你的原文件一个字节都不会动"
-        )
-        if not info.get("word_available"):
-            unavailable = submenu.addAction("本机没有可用的 Word / WPS")
-            unavailable.setEnabled(False)
-            unavailable.setToolTip(info.get("reason") or info.get("word_reason") or "")
-            return
-
         candidates = list(info.get("candidates") or [])
-        for candidate in candidates[:MAX_WORD_COMPARE_ITEMS]:
-            prefix = "与上一稿" if candidate.get("is_previous") else "与"
-            label = f"{prefix} {candidate['label']} 比较"
-            if candidate.get("when"):
-                label += f"（{candidate['when']}）"
-            version_id = candidate["version_id"]
-            action = submenu.addAction(
-                label,
-                lambda _checked=False, other=version_id: self.fileWordCompareRequested.emit(
-                    entry.version_id, entry.file_id, other
-                ),
+        for engine in info.get("engines") or []:
+            kind = str(engine.get("kind") or "")
+            label = str(engine.get("label") or kind)
+            submenu = menu.addMenu(compare_icon(16), f"用 {label} 比较")
+            # 提示要挂在**父菜单里那一项**上（``menuAction``）：挂在 QMenu 上
+            # 只在某些风格下才显示，用户把鼠标停在"用 Word 比较"这一行时
+            # 看到的多半还是空的（实测就是这个样子）
+            entry_action = submenu.menuAction()
+            entry_action.setToolTip(
+                f"调用本机 {label} 的「审阅 → 比较」，生成一份带修订标记的文档；\n"
+                "库里的文件与你的原文件一个字节都不会动"
             )
-            action.setToolTip(
-                f"以 {info.get('name', '')} 为修订版、{candidate['label']} 为原文，"
-                f"让 {engine_label} 生成一份带修订标记的文档"
-            )
-        if not candidates:
-            empty = submenu.addAction("没有更早的稿可以比")
-            empty.setEnabled(False)
-            empty.setToolTip(info.get("reason") or "")
-        elif len(candidates) > MAX_WORD_COMPARE_ITEMS:
-            more = submenu.addAction(
-                f"……还有 {len(candidates) - MAX_WORD_COMPARE_ITEMS} 稿更早的"
-                "（用「看年轮」挑）"
-            )
-            more.setEnabled(False)
+            if not engine.get("available"):
+                # 没装这一家：整条子菜单灰掉（点不动），提示里说清为什么。
+                # 灰的是**父菜单里那一项**（``menuAction``）：QMenu 自己是弹出窗，
+                # 只 QMenu.setEnabled 在有些风格下标题照样是黑的
+                submenu.setEnabled(False)
+                entry_action.setEnabled(False)
+                entry_action.setToolTip(
+                    str(engine.get("reason") or info.get("word_reason") or "")
+                )
+                continue
+            if not info.get("word_available"):
+                # 理论上走不到（这条可用说明至少有一家装着），留着兜底
+                submenu.setEnabled(False)
+                entry_action.setEnabled(False)
+                entry_action.setToolTip(str(info.get("reason") or ""))
+                continue
+            if not candidates:
+                empty = submenu.addAction("没有更早的稿可以比")
+                empty.setEnabled(False)
+                empty.setToolTip(info.get("reason") or "")
+                continue
+            for candidate in candidates[:MAX_WORD_COMPARE_ITEMS]:
+                prefix = "与上一稿" if candidate.get("is_previous") else "与"
+                item_label = f"{prefix} {candidate['label']} 比较"
+                if candidate.get("when"):
+                    item_label += f"（{candidate['when']}）"
+                version_id = candidate["version_id"]
+                action = submenu.addAction(
+                    item_label,
+                    lambda _checked=False, other=version_id, use=kind:
+                    self.fileWordCompareRequested.emit(
+                        entry.version_id, entry.file_id, other, use
+                    ),
+                )
+                action.setToolTip(
+                    f"以 {info.get('name', '')} 为修订版、{candidate['label']} 为原文，"
+                    f"让 {label} 生成一份带修订标记的文档"
+                )
+            if len(candidates) > MAX_WORD_COMPARE_ITEMS:
+                more = submenu.addAction(
+                    f"……还有 {len(candidates) - MAX_WORD_COMPARE_ITEMS} 稿更早的"
+                    "（用「看年轮」挑）"
+                )
+                more.setEnabled(False)
 
     def show_files_menu(self, rows: list[FileRow], global_pos) -> None:
         """**多选**文件行的右键菜单：只有批量动作（导出 / 删除）。
